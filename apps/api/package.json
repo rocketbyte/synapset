@@ -9,8 +9,9 @@
     "dev": "tsx watch --env-file-if-exists=../../.env src/main.ts"
   },
   "dependencies": {
-    "@synapset/core": "workspace:*",
     "@fastify/swagger": "^9.9.2",
+    "@scalar/fastify-api-reference": "1.73.1",
+    "@synapset/core": "workspace:*",
     "fastify": "^5.12.7",
     "fastify-type-provider-zod": "^7.0.0",
     "lru-cache": "^11.5.3",

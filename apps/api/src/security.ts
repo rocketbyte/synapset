@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type {
   FastifyInstance,
   FastifyReply,
@@ -67,6 +67,47 @@ const SECURITY_HEADERS = {
   'x-frame-options': 'DENY',
 };
 
+/** The API reference (Scalar) is the one HTML surface; it is public and self-hosted. */
+export const DOCS_PREFIX = '/docs';
+
+/** Same posture for the reference page, relaxed only as far as rendering it needs: no third-party origins. */
+const DOCS_HEADERS = {
+  ...SECURITY_HEADERS,
+  'cache-control': 'public, max-age=300',
+  'content-security-policy': docsPolicy([]),
+};
+
+function docsPolicy(scriptHashes: string[]) {
+  return [
+    "default-src 'none'",
+    `script-src 'self'${scriptHashes.map((hash) => ` '${hash}'`).join('')}`,
+    // The bundle injects its stylesheet at runtime.
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    // "Test request" calls this API from the page.
+    "connect-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+}
+
+const INLINE_SCRIPT = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g;
+
+/** Allows exactly the inline scripts the page was rendered with, so no 'unsafe-inline' is needed. */
+function inlineScriptHashes(html: string) {
+  return [...html.matchAll(INLINE_SCRIPT)].map(
+    ([, body]) =>
+      `sha256-${createHash('sha256')
+        .update(body ?? '')
+        .digest('base64')}`,
+  );
+}
+
+const isDocsRoute = (url: string | undefined) =>
+  url === DOCS_PREFIX || (url?.startsWith(`${DOCS_PREFIX}/`) ?? false);
+
 /**
  * Request pipeline for every scoped route:
  * 1. authenticate the Bearer API key (failed attempts are throttled per client IP);
@@ -84,7 +125,8 @@ export function registerSecurity(app: App, options: SecurityOptions) {
   app.decorateRequest('generationQueued', false);
 
   app.addHook('onRequest', async (request, reply) => {
-    reply.headers({ ...SECURITY_HEADERS, 'x-request-id': request.id });
+    const headers = isDocsRoute(request.routeOptions.url) ? DOCS_HEADERS : SECURITY_HEADERS;
+    reply.headers({ ...headers, 'x-request-id': request.id });
     const scope = request.routeOptions.config.scope;
     if (!scope) return;
 
@@ -99,6 +141,13 @@ export function registerSecurity(app: App, options: SecurityOptions) {
     }
     request.principal = principal;
     await admit(request, reply, principal);
+  });
+
+  app.addHook('onSend', async (request, reply, payload) => {
+    if (typeof payload === 'string' && isDocsRoute(request.routeOptions.url) && payload.includes('<script')) {
+      reply.header('content-security-policy', docsPolicy(inlineScriptHashes(payload)));
+    }
+    return payload;
   });
 
   app.addHook('onResponse', async (request, reply) => {

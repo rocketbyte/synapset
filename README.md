@@ -38,7 +38,7 @@ Options are shuffled server-side after generation, so the position of the correc
 
 ## API
 
-Machine-readable contract: `GET /openapi.json` (OpenAPI 3, generated from the same Zod schemas that validate requests and responses).
+Integration guide for API consumers (quickstart, endpoints, errors, limits, client examples): [docs/api.md](docs/api.md). Interactive reference: `/docs` ([Scalar](https://github.com/scalar/scalar), self-hosted: the page loads nothing from third-party origins). Machine-readable contract: `GET /openapi.json` (OpenAPI 3, generated from the same Zod schemas that validate requests and responses).
 
 ### Authentication
 

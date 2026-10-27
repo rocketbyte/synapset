@@ -287,5 +287,26 @@ describe('assessments', () => {
       expect.arrayContaining(['/v1/assessments', '/v1/assessments/{id}', '/v1/jobs/{id}', '/v1/usage']),
     );
     expect(spec.components.securitySchemes).toHaveProperty('apiKey');
+    expect(Object.keys(spec.paths).some((path) => path.startsWith('/docs'))).toBe(false);
+  });
+
+  it('serves a self-hosted API reference without authentication', async () => {
+    const { app } = await setup();
+    const page = await app.inject({ method: 'GET', url: '/docs/' });
+    expect(page.statusCode).toBe(200);
+    expect(page.headers['content-type']).toMatch(/^text\/html/);
+    const csp = String(page.headers['content-security-policy']);
+    expect(csp).toMatch(/script-src 'self' 'sha256-[A-Za-z0-9+/=]+';/);
+    expect(csp).not.toContain('http');
+    expect(csp).toContain("connect-src 'self'");
+
+    const script = await app.inject({ method: 'GET', url: '/docs/js/scalar.js' });
+    expect(script.statusCode).toBe(200);
+    const spec = await app.inject({ method: 'GET', url: '/docs/openapi.json' });
+    expect(spec.json()).toMatchObject({ info: { title: 'Synapset Assessments API' } });
+
+    // The API itself keeps the strict policy.
+    const api = await app.inject({ method: 'GET', url: '/v1/usage' });
+    expect(api.headers['content-security-policy']).toBe("default-src 'none'; frame-ancestors 'none'");
   });
 });
