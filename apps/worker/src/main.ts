@@ -35,7 +35,12 @@ const service = new GenerationService(
   repository,
   embedder,
   createLlmProvider(config, logger),
-  new QuestionBank(repository, embedder, { margin: config.QUESTION_REUSE_MARGIN }, logger),
+  new QuestionBank(
+    repository,
+    embedder,
+    { margin: config.QUESTION_REUSE_MARGIN, strictMargin: config.QUESTION_REUSE_STRICT_MARGIN },
+    logger,
+  ),
   new SpendGuard(limits.store, config.LLM_DAILY_BUDGET_USD),
   usage,
   {

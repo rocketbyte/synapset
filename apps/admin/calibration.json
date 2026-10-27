@@ -1,0 +1,135 @@
+{
+  "description": "Labelled reuse decisions for `pnpm admin calibrate`. Each case is a request; `related` questions would be acceptable in its assessment, `unrelated` ones would not. Unrelated items are deliberately close (same field, different focus) so the margin is tested where it matters. Questions are written as the bank embeds them: the question followed by its correct option.",
+  "cases": [
+    {
+      "topic": "Finance",
+      "context": "Focus on personal income taxes",
+      "related": [
+        "What is a tax deduction? An expense that reduces taxable income",
+        "What does a marginal tax rate apply to? The next unit of taxable income",
+        "What is a tax credit? An amount subtracted directly from the tax owed",
+        "Which form reports a US employee's annual wages and withheld taxes? Form W-2",
+        "What is withholding tax? Tax an employer deducts from wages before paying them"
+      ],
+      "unrelated": [
+        "What does a P/E ratio compare? Share price to earnings per share",
+        "What is diversification in investing? Spreading money across different assets",
+        "What does a central bank's policy rate influence? The cost of borrowing",
+        "What is a bond's coupon? Its periodic interest payment",
+        "What is compound interest? Interest earned on previous interest"
+      ]
+    },
+    {
+      "topic": "Income tax basics",
+      "related": [
+        "What is taxable income? Gross income minus deductions and exemptions",
+        "What is a progressive tax system? Higher incomes pay higher rates",
+        "What is a standard deduction? A fixed amount that reduces taxable income",
+        "What is a tax bracket? A range of income taxed at one rate"
+      ],
+      "unrelated": [
+        "What is a value-added tax charged on? Each stage of production and sale",
+        "What does an auditor verify? That financial statements are fairly presented",
+        "What is a balance sheet? A statement of assets, liabilities and equity",
+        "What is a tariff? A tax on imported goods"
+      ]
+    },
+    {
+      "topic": "Python basics",
+      "related": [
+        "What does len() return for a list? Its number of elements",
+        "How do you start a for loop over a list in Python? for item in items:",
+        "What is the result of 7 // 2 in Python? 3",
+        "Which keyword defines a function in Python? def",
+        "What type does input() return in Python 3? str"
+      ],
+      "unrelated": [
+        "What does a JavaScript Promise represent? A value available in the future",
+        "What does SQL's GROUP BY do? Aggregates rows that share values",
+        "What does the Java keyword final do on a variable? Prevents reassignment",
+        "What is a Rust borrow? A reference that does not take ownership",
+        "What does git rebase do? Replays commits onto another base"
+      ]
+    },
+    {
+      "topic": "Python",
+      "context": "Async programming with asyncio",
+      "related": [
+        "What does await do inside a coroutine? Suspends it until the awaitable completes",
+        "What does asyncio.gather run? Several awaitables concurrently",
+        "Which function starts the asyncio event loop for a coroutine? asyncio.run",
+        "What does async def define? A coroutine function"
+      ],
+      "unrelated": [
+        "What does a Python list comprehension produce? A new list",
+        "What does the with statement manage? A context such as an open file",
+        "What does pip install? Python packages",
+        "What does a Python dictionary map? Keys to values"
+      ]
+    },
+    {
+      "topic": "Human anatomy",
+      "context": "The cardiovascular system",
+      "related": [
+        "How many chambers does the human heart have? Four",
+        "Which vessels carry blood away from the heart? Arteries",
+        "What do red blood cells carry? Oxygen",
+        "Which valve separates the left atrium and left ventricle? The mitral valve"
+      ],
+      "unrelated": [
+        "Which bone is the longest in the human body? The femur",
+        "What do the kidneys filter? Blood, producing urine",
+        "Where does most digestion of food occur? The small intestine",
+        "Which part of the brain coordinates balance? The cerebellum"
+      ]
+    },
+    {
+      "topic": "World history",
+      "context": "The French Revolution",
+      "related": [
+        "In what year was the Bastille stormed? 1789",
+        "Who led the Reign of Terror? Maximilien Robespierre",
+        "What was the Estates-General? France's assembly of the three estates",
+        "Which document of 1789 proclaimed citizens' rights? The Declaration of the Rights of Man and of the Citizen"
+      ],
+      "unrelated": [
+        "Who was the first emperor of Rome? Augustus",
+        "In what year did the Berlin Wall fall? 1989",
+        "What started the First World War? The assassination of Archduke Franz Ferdinand",
+        "Which empire built Machu Picchu? The Inca"
+      ]
+    },
+    {
+      "topic": "Networking",
+      "context": "DNS",
+      "related": [
+        "What does DNS translate? Domain names into IP addresses",
+        "What does an A record hold? An IPv4 address",
+        "What is a CNAME record? An alias to another domain name",
+        "What does a DNS TTL control? How long a record may be cached"
+      ],
+      "unrelated": [
+        "What does TCP's three-way handshake establish? A connection",
+        "What does a subnet mask define? The network part of an address",
+        "What does HTTPS add to HTTP? Encryption with TLS",
+        "What layer does a switch operate at? The data link layer"
+      ]
+    },
+    {
+      "topic": "Cooking",
+      "context": "Baking bread",
+      "related": [
+        "What makes bread dough rise? Yeast producing carbon dioxide",
+        "What does kneading develop in dough? Gluten",
+        "What is proofing? Letting shaped dough rise before baking",
+        "What is a sourdough starter? A culture of wild yeast and bacteria"
+      ],
+      "unrelated": [
+        "What does searing meat produce? A browned crust",
+        "What is a roux? Flour cooked in fat to thicken sauces",
+        "What is the main ingredient of hummus? Chickpeas",
+        "What does blanching vegetables involve? Brief boiling then cooling"
+      ]
+    }
+  ]
+}

@@ -6,6 +6,14 @@ export const OPTIONS_PER_QUESTION = 4;
 export const MAX_TOPIC_LENGTH = 120;
 /** Bounds the prompt tokens a caller's guidance can add. */
 export const MAX_CONTEXT_LENGTH = 1000;
+export const MAX_STYLE_LENGTH = 300;
+
+/** How freely a request may reuse bank questions; `off` always generates. */
+export const REUSE_MODES = ['auto', 'strict', 'off'] as const;
+export type ReuseMode = (typeof REUSE_MODES)[number];
+
+export const REPORT_REASONS = ['wrong_answer', 'ambiguous', 'off_topic', 'outdated', 'other'] as const;
+export type ReportReason = (typeof REPORT_REASONS)[number];
 
 /** Minified keys keep LLM output tokens and storage small. */
 export const QuestionSchema = z.object({
@@ -49,6 +57,7 @@ export const GenerateMessageSchema = z.object({
   accountId: z.string().min(1),
   topic: z.string().min(1).max(MAX_TOPIC_LENGTH),
   context: z.string().max(MAX_CONTEXT_LENGTH).optional(),
+  style: z.string().max(MAX_STYLE_LENGTH).optional(),
   locale: LocaleSchema,
   questionsPerLevel: z.number().int().positive(),
   promptVersion: z.string(),
@@ -68,8 +77,10 @@ export interface Assessment {
   id: string;
   topic: string;
   topicNormalized: string;
-  /** Caller guidance the questions were generated or selected for. */
+  /** Caller guidance on what to cover, which the questions were generated or selected for. */
   context: string | null;
+  /** Caller guidance on audience, tone or format. */
+  style: string | null;
   locale: string;
   /** Hash of everything that changes generated content; vector search is pre-filtered on it. */
   scope: string;
@@ -81,6 +92,8 @@ export interface Assessment {
   usage: TokenUsage;
   /** Questions taken from the bank rather than generated for this assessment. */
   reusedQuestions: number;
+  /** Bank id of each question, in order; lets a quarantined question invalidate every assessment using it. */
+  questionIds: string[];
   createdAt: Date;
   expiresAt: Date;
 }
@@ -88,11 +101,30 @@ export interface Assessment {
 /** A checked question stored on its own, so other assessments can reuse it without an LLM call. */
 export interface BankQuestion extends Question {
   id: string;
-  /** Hash of what makes questions interchangeable: locale, prompt version, embedding model. */
+  /** Hash of what makes questions interchangeable: locale, style, prompt version, embedding model. */
   scope: string;
   /** Embedding of the question and its correct option. */
   embedding: number[];
   sourceAssessmentId: string;
+  /** Quarantined questions are never reused and block identical text from being stored again. */
+  status: 'active' | 'quarantined';
+  /** Distinct accounts that reported the question. */
+  reports: number;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+export interface QuestionReport {
+  id: string;
+  questionId: string;
+  assessmentId: string;
+  accountId: string;
+  reason: ReportReason;
+  comment: string | null;
+  /** Whether the question came from the bank in the reported assessment: calibration signal for reuse. */
+  reused: boolean;
+  /** Set when an operator restores the question; dismissed reports no longer count toward quarantine. */
+  dismissed: boolean;
   createdAt: Date;
   expiresAt: Date;
 }

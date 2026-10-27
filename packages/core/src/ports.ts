@@ -1,7 +1,15 @@
 import type { Account, ApiKeyRecord, Principal } from './auth.js';
 import type { LlmProviderName } from './config.js';
 import type { PromptInput, VerifyInput } from './prompt.js';
-import type { Assessment, BankQuestion, GenerateMessage, Job, Question, TokenUsage } from './schemas.js';
+import type {
+  Assessment,
+  BankQuestion,
+  GenerateMessage,
+  Job,
+  Question,
+  QuestionReport,
+  TokenUsage,
+} from './schemas.js';
 
 export interface LlmCall {
   provider: LlmProviderName;
@@ -82,7 +90,27 @@ export interface AssessmentRepository {
   ): Promise<QuestionMatch[]>;
   /** Missing ids are skipped: bank questions expire on their own. */
   getQuestions(ids: readonly string[]): Promise<BankQuestion[]>;
+  /** Upserts content and embedding; never resets a question's status or report count. */
   saveQuestions(questions: readonly BankQuestion[]): Promise<void>;
+
+  /** Stores the report unless this account already reported this question; returns whether it was new. */
+  recordReport(report: QuestionReport): Promise<boolean>;
+  /** Distinct accounts that reported the question, not counting dismissed reports. */
+  countReports(questionId: string): Promise<number>;
+  /** Marks every report of the question dismissed; returns how many changed. */
+  dismissReports(questionId: string): Promise<number>;
+  /**
+   * Sets a question's status and report count, creating a content-only record (no embedding, so never
+   * searchable) when the bank has no entry for it, so a quarantine still blocks the text from returning.
+   */
+  markQuestion(
+    question: Pick<BankQuestion, 'id' | 'scope' | 'q' | 'o' | 'a' | 'e' | 'd'>,
+    update: { status: BankQuestion['status']; reports: number; expiresAt: Date },
+  ): Promise<void>;
+  /** Expires every assessment that contains the question, so the next request rebuilds it without it. */
+  expireAssessmentsWith(questionId: string, now: Date): Promise<number>;
+  expireAssessment(id: string, now: Date): Promise<void>;
+  listReports(limit: number): Promise<QuestionReport[]>;
 
   getJob(id: string): Promise<Job | null>;
   /** Creates or resets the job unless one is already in flight. `claimed` means the caller must publish. */

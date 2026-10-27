@@ -1,9 +1,11 @@
 import { createHash, randomInt } from 'node:crypto';
 import { InvalidOutputError } from './errors.js';
-import { LEVELS, OPTIONS_PER_QUESTION, type Assessment, type Question } from './schemas.js';
+import { LEVELS, OPTIONS_PER_QUESTION, type Assessment, type Question, type ReuseMode } from './schemas.js';
 
 export interface GenerationScope {
   locale: string;
+  /** styleKey() of the request: a similar assessment in another style is not a match. */
+  style: string;
   questionsPerLevel: number;
   promptVersion: string;
   embeddingModel: string;
@@ -22,9 +24,33 @@ export function cleanContext(raw: string | undefined): string | null {
   return cleaned ? cleaned : null;
 }
 
-/** What a request asks for, as one text: the cache key and every embedding search derive from it. */
+/** What a request is about, as one text: every embedding search derives from it. Style is not subject matter. */
 export function requestText(topicNormalized: string, context: string | null): string {
   return context ? `${topicNormalized}. ${context.toLowerCase()}` : topicNormalized;
+}
+
+/** Style compared by its words: "For kids." and "for kids" are the same style. */
+export function styleKey(style: string | null): string {
+  return (style ?? '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+export interface RequestIdentity {
+  topicNormalized: string;
+  context: string | null;
+  style: string | null;
+  reuse: ReuseMode;
+}
+
+/** Everything that changes which questions a request gets; the cache key derives from it. */
+export function requestIdentity({ topicNormalized, context, style, reuse }: RequestIdentity): string {
+  const parts = [requestText(topicNormalized, context)];
+  const key = styleKey(style);
+  if (key) parts.push(`style: ${key}`);
+  if (reuse !== 'auto') parts.push(`reuse: ${reuse}`);
+  return parts.join('\n');
 }
 
 /** Text embedded for a bank question: retrieval matched topics best on the question plus its answer. */
@@ -33,16 +59,17 @@ export const questionText = (question: Pick<Question, 'q' | 'o' | 'a'>) =>
 
 export interface BankScope {
   locale: string;
+  /** styleKey() of the request; questions are only reused within the style they were written for. */
+  style: string;
   promptVersion: string;
   embeddingModel: string;
 }
 
 /** Questions are interchangeable across assessments of any size, so the bank scope omits the count. */
 export function bankScopeKey(scope: BankScope): string {
-  return sha256(JSON.stringify(['bank', scope.locale, scope.promptVersion, scope.embeddingModel])).slice(
-    0,
-    24,
-  );
+  return sha256(
+    JSON.stringify(['bank', scope.locale, scope.style, scope.promptVersion, scope.embeddingModel]),
+  ).slice(0, 24);
 }
 
 /** Bank document id: the same question text in a scope is stored once. */
@@ -57,7 +84,13 @@ export function cosine(a: readonly number[], b: readonly number[]): number {
 
 export function scopeKey(scope: GenerationScope): string {
   return sha256(
-    JSON.stringify([scope.locale, scope.questionsPerLevel, scope.promptVersion, scope.embeddingModel]),
+    JSON.stringify([
+      scope.locale,
+      scope.style,
+      scope.questionsPerLevel,
+      scope.promptVersion,
+      scope.embeddingModel,
+    ]),
   ).slice(0, 24);
 }
 
@@ -143,10 +176,17 @@ export function finalizeQuestions(raw: readonly Question[], counts: LevelCounts 
   return LEVELS.flatMap((level) => (byLevel.get(level) ?? []).slice(0, wanted[level]).map(shuffleOptions));
 }
 
+/** Positions of the first `perLevel` questions of each difficulty, in presentation order. */
+export function selectIndexes(questions: readonly Pick<Question, 'd'>[], perLevel: number): number[] {
+  return LEVELS.flatMap((level) =>
+    questions.flatMap((question, i) => (question.d === level ? [i] : [])).slice(0, perLevel),
+  );
+}
+
 /** The first `perLevel` questions of each difficulty: every caller sees the same subset for a given count. */
 export function selectQuestions<T extends Pick<Question, 'd'>>(
   questions: readonly T[],
   perLevel: number,
 ): T[] {
-  return LEVELS.flatMap((level) => questions.filter((question) => question.d === level).slice(0, perLevel));
+  return selectIndexes(questions, perLevel).map((i) => questions[i] as T);
 }

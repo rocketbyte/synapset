@@ -18,12 +18,14 @@ Client ─▶ api (Cloud Run, public)
          worker (Cloud Run, internal) → lease job → LLM → validate → store assessment + vector
 ```
 
-- **Cache key:** sha256 of the normalized topic and context plus its scope (locale, questions per level, prompt version, embedding model). Changing any of these produces new assessments; changing the LLM does not.
+- **Cache key:** sha256 of the normalized topic, context, style and reuse mode plus its scope (locale, style, questions per level, prompt version, embedding model). Changing any of these produces new assessments; changing the LLM does not.
 - **Semantic match:** cosine similarity ≥ `SIMILARITY_THRESHOLD` (0.88) within the same scope. A match is saved as an alias, so the next identical request is an exact hit.
 - **Expiry:** `expiresAt` is checked on every read; an expired assessment is regenerated in full. Firestore TTL deletes old documents later (typically within 24 hours).
 - **Deduplication:** concurrent misses share one job; the worker's lease and idempotent writes make Pub/Sub redeliveries harmless.
-- **Question bank:** every checked question is stored on its own (Firestore `questions`) with an embedding of its text and correct answer. On a miss, the API embeds topic + context once and searches the bank for each difficulty level. A question is reused if its similarity exceeds the request's noise floor (its similarity to a fixed set of unrelated questions) by `QUESTION_REUSE_MARGIN` (0.08). Near-duplicates are collapsed. If every level is covered, the assessment is composed with no LLM call and no generation charged. Otherwise the worker generates only the missing questions, tells the model which ones exist, and drops any new one that duplicates them. Calibrated on gemini-embedding-2: at 0.08, 96% of reused questions were relevant and 59% of relevant ones were found; reuse fails open (search errors fall back to generation). `REUSE_QUESTIONS=false` disables it.
-- **Context:** optional caller guidance (focus, audience, emphasis; up to 1000 characters). It is part of the cache key and the embedded request text, and it is passed to the generator inside `<context>` tags as guidance that can't override the rules.
+- **Question bank:** every checked question is stored on its own (Firestore `questions`) with an embedding of its text and correct answer. On a miss, the API embeds topic + context once and searches the bank for each difficulty level. A question is reused if its similarity exceeds the request's noise floor (its similarity to a fixed set of unrelated questions) by `QUESTION_REUSE_MARGIN` (0.08). Near-duplicates and quarantined questions are skipped. If every level is covered, the assessment is composed with no LLM call and no generation charged. Otherwise the worker generates only the missing questions, tells the model which ones exist, and drops any new one that duplicates them. Bank entries are partitioned by locale, style, prompt version and embedding model, so a question is only reused where it was written for the same audience. Callers choose `reuse`: `auto` (default), `strict` (`QUESTION_REUSE_STRICT_MARGIN`, 0.12) or `off` (always generate, no semantic match). Reuse fails open: search errors fall back to generation. `REUSE_QUESTIONS=false` disables it service-wide.
+- **Calibration:** `pnpm admin calibrate` embeds a labelled set (`apps/admin/calibration.json`: requests with related and close-but-unrelated questions) using the live embedding model and the bank's own floor rule, then prints precision and recall per margin and the misjudged pairs. On gemini-embedding-2 the bundled set gives 97% precision / 91% recall at 0.08 and 100% / 62% at 0.12. Rerun it after changing the embedding model, and extend the set with real requests.
+- **Context and style:** optional caller guidance. `context` (up to 1000 characters) says what to cover; it is part of the cache key and of the embedded request text used to find related questions. `style` (up to 300 characters) says how to write: audience, tone, format, such as "for 10-year-olds" or "scenario-based questions for nurses". It is part of the cache key and the bank scope (normalised, so casing and punctuation don't matter) but not of the embedding. Both are passed to the generator inside tags as guidance that can't override the rules.
+- **Feedback loop:** `POST /v1/assessments/{id}/feedback` reports a bad question (`wrong_answer`, `ambiguous`, `off_topic`, `outdated`, `other`). Each account can report a question once. When `FEEDBACK_QUARANTINE_REPORTS` (2) distinct accounts have reported it, the question is quarantined: never reused, blocked if the model writes the same text again, and every assessment containing it is expired, so the next request rebuilds it (reusing the rest from the bank) without it. Reports keep whether the question was reused, so `pnpm admin feedback summary` shows if `off_topic` reports concentrate on reused questions, a sign the margin is too loose. Operators can `question quarantine` or, after review, `question restore` (which dismisses the reports so they stop counting).
 - **Question count:** every topic is generated once with `QUESTIONS_PER_LEVEL` questions per level (default 10, max 20). Callers pass `questionsPerLevel` to receive the first N per level of the same cached assessment, so the count never multiplies generations.
 - **Answer check:** with `VERIFY_ANSWERS=true` (default), the worker generates about 25% spare questions, has the model answer each one blind, and keeps only those whose key it confirms and judges unambiguous. Questions that pass are kept, and a second round asks only for what's still missing; still short after that fails the attempt, and Pub/Sub retries it. The check adds roughly 30–40% to generation cost.
 - **Answers stay server-side:** questions are returned without `a`/`e`; the grade endpoint scores answers and then reveals them.
@@ -57,17 +59,22 @@ pnpm admin key list --account acct_…
 pnpm admin key revoke --key <keyId>
 pnpm admin account plan --account acct_… --plan enterprise
 pnpm admin account suspend --account acct_…
+pnpm admin feedback list --limit 20                      # latest question reports
+pnpm admin feedback summary                              # by reason, reused vs generated
+pnpm admin question quarantine --question <id>           # or: question restore --question <id>
+pnpm admin calibrate                                     # precision/recall per reuse margin
 ```
 
 ### Endpoints
 
-| Method | Path                                                                                              | Scope   | Result                                                                                        |
-| ------ | ------------------------------------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------- |
-| `POST` | `/v1/assessments` `{ "topic", "context"?, "locale"?: "en", "ttlSeconds"?, "questionsPerLevel"? }` | `write` | `200 { status: "ready", match: exact                                                          | semantic | composed, assessment }`or`202 { jobId, status }`with`Location`and`Retry-After` |
-| `GET`  | `/v1/jobs/{jobId}`                                                                                | `read`  | `{ jobId, status, assessmentId, error }`                                                      |
-| `GET`  | `/v1/assessments/{id}?questionsPerLevel=`                                                         | `read`  | `{ id, topic, locale, questionsPerLevel, createdAt, expiresAt, questions: [{ i, q, o, d }] }` |
-| `POST` | `/v1/assessments/{id}/grade` `{ "questionsPerLevel"?, "answers": [0-3 or null, ...] }`            | `grade` | `{ score, total, results: [{ i, correct, a, e }] }`                                           |
-| `GET`  | `/v1/usage`                                                                                       | `read`  | Requests this month and generations today against the plan, plus rate limits                  |
+| Method | Path                                                                                                                  | Scope   | Result                                                                                        |
+| ------ | --------------------------------------------------------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `POST` | `/v1/assessments` `{ "topic", "context"?, "style"?, "reuse"?, "locale"?: "en", "ttlSeconds"?, "questionsPerLevel"? }` | `write` | `200 { status: "ready", match: exact                                                          | semantic | composed, assessment }`or`202 { jobId, status }`with`Location`and`Retry-After` |
+| `GET`  | `/v1/jobs/{jobId}`                                                                                                    | `read`  | `{ jobId, status, assessmentId, error }`                                                      |
+| `GET`  | `/v1/assessments/{id}?questionsPerLevel=`                                                                             | `read`  | `{ id, topic, locale, questionsPerLevel, createdAt, expiresAt, questions: [{ i, q, o, d }] }` |
+| `POST` | `/v1/assessments/{id}/grade` `{ "questionsPerLevel"?, "answers": [0-3 or null, ...] }`                                | `grade` | `{ score, total, results: [{ i, correct, a, e }] }`                                           |
+| `POST` | `/v1/assessments/{id}/feedback` `{ "questionsPerLevel"?, "i", "reason", "comment"? }`                                 | `read`  | `202 { status: recorded \| duplicate, quarantined }`                                          |
+| `GET`  | `/v1/usage`                                                                                                           | `read`  | Requests this month and generations today against the plan, plus rate limits                  |
 
 Question keys: `q` question, `o` four options, `a` correct option index, `e` explanation, `d` difficulty (1 easy, 2 medium, 3 hard). Job `error` is `topic_rejected`, `generation_capacity_exhausted` or `generation_failed`.
 
@@ -261,4 +268,15 @@ These are not implemented.
 
 ## Configuration
 
-Validated at startup by `packages/core/src/config.ts`; see `.env.example` for the full list. Keep `EMBEDDING_DIMENSIONS` (code) and the vector index dimension (Terraform) in sync, and bump `PROMPT_VERSION` whenever the prompt changes.
+Validated at startup by `packages/core/src/config.ts`; see `.env.example` for the full list. Keep `EMBEDDING_DIMENSIONS` (code) and the vector index dimension (Terraform) in sync, and bump `PROMPT_VERSION` whenever the prompt changes. A bump starts a new cache and a new bank partition: existing assessments stay valid until they expire but are no longer matched.
+
+Question generation and reuse:
+
+| Variable                       | Default | Meaning                                                                                                |
+| ------------------------------ | ------- | ------------------------------------------------------------------------------------------------------ |
+| `QUESTIONS_PER_LEVEL`          | `10`    | Questions generated per difficulty level (max 20); callers can request fewer                           |
+| `VERIFY_ANSWERS`               | `true`  | Blind second pass that discards questions whose key it doesn't confirm                                 |
+| `REUSE_QUESTIONS`              | `true`  | Reuse bank questions across assessments                                                                |
+| `QUESTION_REUSE_MARGIN`        | `0.08`  | Similarity above the request's noise floor needed to reuse (`reuse: auto`); see `pnpm admin calibrate` |
+| `QUESTION_REUSE_STRICT_MARGIN` | `0.12`  | The same for `reuse: strict`; must be ≥ the margin                                                     |
+| `FEEDBACK_QUARANTINE_REPORTS`  | `2`     | Distinct accounts that must report a question before it is quarantined                                 |

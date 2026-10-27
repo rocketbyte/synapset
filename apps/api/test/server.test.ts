@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AssessmentService,
   Authenticator,
+  FeedbackService,
   LogUsageRecorder,
   MemoryLimitStore,
   SpendGuard,
@@ -30,6 +31,7 @@ async function setup(
     limits?: Partial<PlanLimits>;
     budgetUsd?: number;
     questionsPerLevel?: number;
+    quarantineAfterReports?: number;
   } = {},
 ) {
   const repo = new InMemoryRepository();
@@ -72,6 +74,11 @@ async function setup(
   );
   const app = await buildServer({
     service,
+    feedback: new FeedbackService(
+      repo,
+      { quarantineAfterReports: options.quarantineAfterReports ?? 2 },
+      createLogger('test', 'silent'),
+    ),
     authenticator: new Authenticator(identities),
     limits,
     usage,
@@ -229,6 +236,50 @@ describe('assessments', () => {
 
     const tooLong = await post({ topic: 'Finance', context: 'x'.repeat(1001) });
     expect(tooLong.statusCode).toBe(400);
+  });
+
+  it('accepts style and reuse, each making a distinct assessment', async () => {
+    const { app, auth } = await setup();
+    const post = (payload: object) =>
+      app.inject({ method: 'POST', url: '/v1/assessments', headers: auth, payload });
+    const ids = await Promise.all(
+      [
+        { topic: 'Finance' },
+        { topic: 'Finance', style: 'For kids.' },
+        { topic: 'Finance', reuse: 'off' },
+      ].map(async (payload) => (await post(payload)).json<{ jobId: string }>().jobId),
+    );
+    expect(new Set(ids).size).toBe(3);
+    // Style is compared by its words.
+    const same = await post({ topic: 'Finance', style: 'for KIDS' });
+    expect(same.json<{ jobId: string }>().jobId).toBe(ids[1]);
+
+    expect((await post({ topic: 'Finance', reuse: 'sometimes' })).statusCode).toBe(400);
+  });
+
+  it('records reports once per account and quarantines a question at the threshold', async () => {
+    const { app, repo, auth } = await setup({ quarantineAfterReports: 1 });
+    const target = assessment({ expiresAt: new Date(Date.now() + 60_000) });
+    repo.assessments.set(target.id, target);
+    const report = (payload: object) =>
+      app.inject({ method: 'POST', url: `/v1/assessments/${target.id}/feedback`, headers: auth, payload });
+
+    const first = await report({ i: 1, reason: 'wrong_answer', comment: 'Option 2 is also correct' });
+    expect(first.statusCode).toBe(202);
+    expect(first.json()).toEqual({ status: 'recorded', quarantined: true });
+    expect([...repo.bank.values()]).toEqual([
+      expect.objectContaining({ q: target.questions[1]?.q, status: 'quarantined', reports: 1 }),
+    ]);
+    // The reported assessment is withdrawn, so the next request rebuilds it without that question.
+    expect(repo.assessments.get(target.id)?.expiresAt.getTime()).toBeLessThanOrEqual(Date.now());
+
+    repo.assessments.set(target.id, target);
+    expect((await report({ i: 1, reason: 'ambiguous' })).json()).toEqual({
+      status: 'duplicate',
+      quarantined: false,
+    });
+    expect((await report({ i: 3, reason: 'other' })).statusCode).toBe(400);
+    expect((await report({ i: 0, reason: 'boring' })).statusCode).toBe(400);
   });
 
   it('rejects invalid and unexpected input', async () => {

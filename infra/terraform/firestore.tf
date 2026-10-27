@@ -66,7 +66,7 @@ resource "google_firestore_index" "questions_vector" {
 # TTL deletes expired documents (typically within 24h); the services check expiresAt themselves.
 # Timestamp fields are exempt from indexing to avoid write hotspots.
 resource "google_firestore_field" "expires_at" {
-  for_each   = toset(["assessments", "topic_keys", "jobs", "limits", "questions"])
+  for_each   = toset(["assessments", "topic_keys", "jobs", "limits", "questions", "question_reports"])
   database   = google_firestore_database.main.name
   collection = each.value
   field      = "expiresAt"
@@ -78,10 +78,11 @@ resource "google_firestore_field" "expires_at" {
 # Fields that are only read, never queried; indexing them would multiply write cost.
 resource "google_firestore_field" "unindexed" {
   for_each = {
-    "assessments/questions" = ["assessments", "questions"]
-    "questions/q"           = ["questions", "q"]
-    "questions/o"           = ["questions", "o"]
-    "questions/e"           = ["questions", "e"]
+    "assessments/questions"    = ["assessments", "questions"]
+    "questions/q"              = ["questions", "q"]
+    "questions/o"              = ["questions", "o"]
+    "questions/e"              = ["questions", "e"]
+    "question_reports/comment" = ["question_reports", "comment"]
   }
   database   = google_firestore_database.main.name
   collection = each.value[0]

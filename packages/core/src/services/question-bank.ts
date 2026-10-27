@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 import { EMBEDDING_DIMENSIONS } from '../config.js';
 import { bankQuestionId, cosine, questionText, type LevelCounts } from '../domain.js';
-import { LEVELS, type BankQuestion, type Question } from '../schemas.js';
+import { LEVELS, type BankQuestion, type Question, type ReuseMode } from '../schemas.js';
 import type { AssessmentRepository, Clock, Embedder } from '../ports.js';
 
 /**
@@ -9,7 +9,7 @@ import type { AssessmentRepository, Clock, Embedder } from '../ports.js';
  * broad queries ("finance") sit closer to everything than focused ones, so one fixed threshold either
  * misses broad matches or admits off-topic ones.
  */
-const BACKGROUND = [
+export const BACKGROUND_QUESTIONS = [
   'What is the capital of Australia? Canberra',
   'Who painted the Mona Lisa? Leonardo da Vinci',
   'What is the chemical symbol for gold? Au',
@@ -37,6 +37,17 @@ const BACKGROUND = [
 ];
 /** Percentile of background similarity taken as the floor; robust to one background item being on-topic. */
 const FLOOR_PERCENTILE = 0.9;
+
+/**
+ * The similarity a query has to unrelated questions anyway. A question is reused when its similarity
+ * exceeds this by the configured margin; calibration uses the same function to choose that margin.
+ */
+export function noiseFloor(queryEmbedding: readonly number[], background: readonly number[][]): number {
+  const similarities = background.map((b) => cosine(queryEmbedding, b)).sort((a, b) => a - b);
+  return similarities[
+    Math.min(similarities.length - 1, Math.floor(FLOOR_PERCENTILE * similarities.length))
+  ] as number;
+}
 /** Candidates fetched per needed question, so the diversity filter has room to work. */
 const OVERFETCH = 3;
 /** Two bank questions this similar test the same idea; only the more relevant is used. */
@@ -44,8 +55,10 @@ const NEAR_DUPLICATE = 0.9;
 const EMBED_CONCURRENCY = 8;
 
 export interface QuestionBankOptions {
-  /** Similarity above the query's noise floor a question needs to be reused. */
+  /** Similarity above the query's noise floor a question needs to be reused (reuse mode `auto`). */
   margin: number;
+  /** The same, for reuse mode `strict`. */
+  strictMargin: number;
 }
 
 /**
@@ -67,9 +80,15 @@ export class QuestionBank {
    * Relevant, mutually distinct bank questions for each level, most relevant first, at most `counts[d]`.
    * Never throws: reuse only saves money, so on any failure the request falls back to generation.
    */
-  async select(queryEmbedding: number[], scope: string, counts: LevelCounts): Promise<BankQuestion[][]> {
+  async select(
+    queryEmbedding: number[],
+    scope: string,
+    counts: LevelCounts,
+    mode: Exclude<ReuseMode, 'off'> = 'auto',
+  ): Promise<BankQuestion[][]> {
     try {
-      const minSimilarity = (await this.floor(queryEmbedding)) + this.options.margin;
+      const margin = mode === 'strict' ? this.options.strictMargin : this.options.margin;
+      const minSimilarity = (await this.floor(queryEmbedding)) + margin;
       const now = this.clock();
       return await Promise.all(
         LEVELS.map(async (level) => {
@@ -84,7 +103,7 @@ export class QuestionBank {
           const chosen: BankQuestion[] = [];
           for (const { question } of matches) {
             if (chosen.length === counts[level]) break;
-            if (question.expiresAt <= now) continue;
+            if (question.status !== 'active' || question.expiresAt <= now) continue;
             if (chosen.some((c) => cosine(c.embedding, question.embedding) >= NEAR_DUPLICATE)) continue;
             chosen.push(question);
           }
@@ -104,6 +123,14 @@ export class QuestionBank {
     } catch (error) {
       this.logger.warn({ err: error }, 'Question bank warm-up failed; the first request will retry');
     }
+  }
+
+  /** Ids among `ids` that reports have quarantined; generated questions with these ids are discarded. */
+  async quarantined(ids: readonly string[]): Promise<Set<string>> {
+    const found = await this.get(ids);
+    return new Set(
+      found.filter((question) => question.status === 'quarantined').map((question) => question.id),
+    );
   }
 
   get(ids: readonly string[]): Promise<BankQuestion[]> {
@@ -158,6 +185,8 @@ export class QuestionBank {
         scope,
         embedding: embeddings[i] as number[],
         sourceAssessmentId,
+        status: 'active' as const,
+        reports: 0,
         createdAt: now,
         expiresAt,
       })),
@@ -165,15 +194,12 @@ export class QuestionBank {
   }
 
   private async floor(queryEmbedding: number[]): Promise<number> {
-    this.background ??= Promise.all(BACKGROUND.map((text) => this.embedder.embed(text))).catch(
+    this.background ??= Promise.all(BACKGROUND_QUESTIONS.map((text) => this.embedder.embed(text))).catch(
       (error: unknown) => {
         this.background = null;
         throw error;
       },
     );
-    const similarities = (await this.background).map((b) => cosine(queryEmbedding, b)).sort((a, b) => a - b);
-    return similarities[
-      Math.min(similarities.length - 1, Math.floor(FLOOR_PERCENTILE * similarities.length))
-    ] as number;
+    return noiseFloor(queryEmbedding, await this.background);
   }
 }

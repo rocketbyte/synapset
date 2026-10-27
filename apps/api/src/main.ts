@@ -2,6 +2,7 @@ import { LRUCache } from 'lru-cache';
 import {
   AssessmentService,
   Authenticator,
+  FeedbackService,
   FirestoreAssessmentRepository,
   FirestoreIdentityRepository,
   LogUsageRecorder,
@@ -36,7 +37,12 @@ const embedder = new VertexEmbedder(
   config.EMBEDDING_MODEL,
 );
 const bank = config.REUSE_QUESTIONS
-  ? new QuestionBank(repository, embedder, { margin: config.QUESTION_REUSE_MARGIN }, logger)
+  ? new QuestionBank(
+      repository,
+      embedder,
+      { margin: config.QUESTION_REUSE_MARGIN, strictMargin: config.QUESTION_REUSE_STRICT_MARGIN },
+      logger,
+    )
   : undefined;
 const service = new AssessmentService(
   repository,
@@ -58,6 +64,11 @@ const service = new AssessmentService(
 
 const app = await buildServer({
   service,
+  feedback: new FeedbackService(
+    repository,
+    { quarantineAfterReports: config.FEEDBACK_QUARANTINE_REPORTS },
+    logger,
+  ),
   authenticator: new Authenticator(new FirestoreIdentityRepository(firestore)),
   limits: limits.store,
   usage,

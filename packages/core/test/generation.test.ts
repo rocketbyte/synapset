@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   BudgetExhaustedError,
   GenerationService,
+  bankQuestionId,
   bankScopeKey,
   questionText,
   QuestionBank,
@@ -59,7 +60,7 @@ describe('GenerationService', () => {
       repo,
       embedder,
       llm,
-      new QuestionBank(repo, embedder, { margin: 0.08 }, silentLogger, () => NOW),
+      new QuestionBank(repo, embedder, { margin: 0.08, strictMargin: 0.12 }, silentLogger, () => NOW),
       new SpendGuard(store, 1, () => NOW),
       usage,
       { leaseSeconds: 300, maxDeliveryAttempts: 5, verifyAnswers: true },
@@ -161,6 +162,7 @@ describe('GenerationService', () => {
   describe('with questions reused from the bank', () => {
     const BANK = bankScopeKey({
       locale: 'en',
+      style: '',
       promptVersion: PROMPT_VERSION,
       embeddingModel: 'fake-embedding',
     });
@@ -204,6 +206,20 @@ describe('GenerationService', () => {
 
       expect(llm.calls).toBe(0);
       expect(repo.assessments.get(JOB_ID)).toMatchObject({ reusedQuestions: 3, model: 'bank' });
+    });
+
+    it('never stores a question that reports have quarantined, even when the model writes it again', async () => {
+      const [first, second] = questions(2).filter((q) => q.d === 2) as [Question, Question];
+      await repo.markQuestion(
+        { id: bankQuestionId(BANK, first), scope: BANK, ...first },
+        { status: 'quarantined', reports: 2, expiresAt: new Date('2028-01-01') },
+      );
+      const llm = new FakeLlm(() => Promise.resolve({ ...successResult(), questions: [first, second] }));
+
+      await service(llm).handle(withReuse, 1);
+
+      expect(repo.assessments.get(JOB_ID)?.questions.find((q) => q.d === 2)?.q).toBe(second.q);
+      expect(repo.bank.get(bankQuestionId(BANK, first))?.status).toBe('quarantined');
     });
 
     it('drops generated questions that duplicate a reused one', async () => {

@@ -32,6 +32,7 @@ import {
 const NOW = new Date('2026-10-26T12:00:00Z');
 const SCOPE: GenerationScope = {
   locale: 'en',
+  style: '',
   questionsPerLevel: 1,
   promptVersion: PROMPT_VERSION,
   embeddingModel: 'fake-embedding',
@@ -196,6 +197,7 @@ describe('AssessmentService.resolve', () => {
 describe('AssessmentService.resolve with the question bank', () => {
   const BANK = bankScopeKey({
     locale: 'en',
+    style: '',
     promptVersion: PROMPT_VERSION,
     embeddingModel: 'fake-embedding',
   });
@@ -219,7 +221,7 @@ describe('AssessmentService.resolve with the question bank', () => {
         jobStaleSeconds: 900,
       },
       {
-        bank: new QuestionBank(repo, embedder, { margin: 0.08 }, silentLogger, () => NOW),
+        bank: new QuestionBank(repo, embedder, { margin: 0.08, strictMargin: 0.12 }, silentLogger, () => NOW),
         clock: () => NOW,
       },
     );
@@ -261,6 +263,26 @@ describe('AssessmentService.resolve with the question bank', () => {
       reuse: [`${BANK}-1-x`, `${BANK}-1-y`, `${BANK}-3-x`],
     });
     expect(await store.get(counterKeys.dailyGenerations(caller.accountId, NOW))).toBe(1);
+  });
+
+  it('reuses questions only within the requested style', async () => {
+    const { repo, queue, service, request, relevant } = setup();
+    await repo.saveQuestions([1, 2, 3].flatMap((d) => [relevant(d, 'x', 10 + d), relevant(d, 'y', 20 + d)]));
+
+    const result = await service.resolve({ ...request, style: 'For kids' }, caller);
+
+    expect(result).toMatchObject({ status: 'pending' });
+    expect(queue.published[0]).toMatchObject({ style: 'For kids', reuse: [] });
+  });
+
+  it('never reuses with reuse "off"', async () => {
+    const { repo, queue, service, request, relevant } = setup();
+    await repo.saveQuestions([1, 2, 3].flatMap((d) => [relevant(d, 'x', 10 + d), relevant(d, 'y', 20 + d)]));
+
+    await expect(service.resolve({ ...request, reuse: 'off' }, caller)).resolves.toMatchObject({
+      status: 'pending',
+    });
+    expect(queue.published[0]?.reuse).toEqual([]);
   });
 
   it('treats different context as a different assessment', async () => {

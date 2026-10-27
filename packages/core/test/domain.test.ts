@@ -12,6 +12,7 @@ import { questions } from './fakes.js';
 
 const scope: GenerationScope = {
   locale: 'en',
+  style: '',
   questionsPerLevel: 2,
   promptVersion: 'v1',
   embeddingModel: 'm',

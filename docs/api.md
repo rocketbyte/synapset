@@ -60,7 +60,10 @@ curl -s "$SYNAPSET_URL/v1/assessments/<assessmentId>/grade" \
 
 - **Cached first.** An assessment is generated once, then served to every caller until it expires. Requesting the same topic again returns `"match": "exact"`. A paraphrase such as "ownership in Rust" for "Rust ownership" returns the existing assessment with `"match": "semantic"`.
 - **Questions are shared across topics.** Every checked question is kept in a question bank. A new request is matched against it by meaning, so "Finance, focusing on taxes" can reuse tax questions written for "Income tax basics". If the bank covers every difficulty level, the assessment is assembled immediately (`"match": "composed"`), with no generation and no generation quota used. Otherwise only the missing questions are generated, and the model is told which questions already exist so it doesn't repeat them.
-- **Context steers the assessment.** The optional `context` tells the generator what to focus on, who the audience is, or what to emphasise or avoid. It is also used to pick relevant questions from the bank. Different context is a different assessment.
+- **Context steers the assessment.** The optional `context` tells the generator what to focus on and what to emphasise or avoid. It is also used to pick relevant questions from the bank. Different context is a different assessment.
+- **Style sets the voice.** The optional `style` sets audience, tone or format, for example `"for 10-year-olds"` or `"scenario-based, for nurses"`. Questions are only reused between requests with the same style (casing and punctuation don't matter), so a children's quiz never borrows questions written for professionals.
+- **You control reuse.** `reuse: "strict"` reuses only very close questions; `"off"` always generates a fresh assessment (it counts against your generation quota).
+- **Bad questions get removed.** Report a question with the [feedback endpoint](#report-a-question). Once enough different accounts report the same question, it is withdrawn everywhere: assessments containing it are expired and rebuilt without it on the next request.
 - **Generated on a miss.** A topic nobody has requested yet is queued for generation, and you get `202 Accepted` with a job to poll. Generating a topic counts against your plan's daily generation quota. Cache hits don't.
 - **Choose how many questions.** Each topic is generated once at the service maximum (10 per level by default). Pass `questionsPerLevel` to receive fewer. Every count is served from the same cached assessment, so a smaller count never triggers a new generation.
 - **Answers are checked before publishing.** After generating, a second model pass answers every question without seeing the key. Questions it answers differently, or finds ambiguous or opinion-based, are discarded and replaced by spares.
@@ -100,6 +103,8 @@ Authorization: Bearer synapset_sk_<keyId>_<secret>
 | `topic`             | string  | yes      | 2–120 characters after trimming. Casing, extra spaces and Unicode variants are normalised.                                                                                                                                                |
 | `locale`            | string  | no       | Language of the questions, such as `en`, `es` or `pt-BR`. Default `en`.                                                                                                                                                                   |
 | `context`           | string  | no       | Guidance, up to 1000 characters: focus areas, audience, what to emphasise or avoid. Example: `"Focus on taxes: deductions, credits and how income tax is calculated."` Treated as guidance only; it can't change the format or the rules. |
+| `style`             | string  | no       | Audience, tone or format, up to 300 characters. Example: `"For high-school students, everyday examples"`. Part of what identifies the assessment.                                                                                         |
+| `reuse`             | string  | no       | `auto` (default): reuse relevant existing questions. `strict`: reuse only very close ones. `off`: always generate, skipping reuse and similar-topic matches.                                                                              |
 | `ttlSeconds`        | integer | no       | How long a newly generated assessment stays cached. Minimum 3600, capped by the service (365 days). Default 30 days. Ignored on a cache hit.                                                                                              |
 | `questionsPerLevel` | integer | no       | Questions per difficulty level in the response, from 1 to the service maximum (`assessments.maxQuestionsPerLevel` in [usage](#get-your-usage)). Default: the maximum. A larger value returns `400`.                                       |
 
@@ -115,6 +120,7 @@ Unknown fields are rejected with `400`.
     "id": "dc003d4d7d13f29316646bbc1a17699849b6648c006a6c013bb17bcafc4c05ac",
     "topic": "Rust ownership",
     "context": null,
+    "style": null,
     "locale": "en",
     "createdAt": "2026-10-27T00:56:55.594Z",
     "expiresAt": "2026-11-26T00:56:55.594Z",
@@ -186,6 +192,28 @@ Send the same `questionsPerLevel` you fetched the assessment with (omit it if yo
 
 Grading stores nothing. You can grade the same assessment as many times as needed, for example once per learner.
 
+### Report a question
+
+`POST /v1/assessments/{id}/feedback` · scope `assessments:read`
+
+```json
+{
+  "questionsPerLevel": 5,
+  "i": 3,
+  "reason": "wrong_answer",
+  "comment": "Option B is also correct since 2024."
+}
+```
+
+| Field               | Type    | Required | Rules                                                                                       |
+| ------------------- | ------- | -------- | ------------------------------------------------------------------------------------------- |
+| `i`                 | integer | yes      | The question's `i` in the selection you were shown                                          |
+| `questionsPerLevel` | integer | no       | The count you fetched with, so `i` refers to the same question. Omit if you didn't pass one |
+| `reason`            | string  | yes      | `wrong_answer`, `ambiguous`, `off_topic`, `outdated` or `other`                             |
+| `comment`           | string  | no       | Up to 500 characters, for the operators reviewing reports                                   |
+
+Returns `202` with `{ "status": "recorded" | "duplicate", "quarantined": boolean }`. Each account counts once per question, so reporting again returns `duplicate` and changes nothing. `quarantined: true` means the question has been withdrawn: the assessment now returns `404`, and `POST`ing the topic again rebuilds it without that question. An `i` outside the selection returns `400`.
+
 ### Get your usage
 
 `GET /v1/usage` · scope `assessments:read`
@@ -217,6 +245,8 @@ Grading stores nothing. You can grade the same assessment as many times as neede
 | ------------------- | -------- | ----------------------------------------------- |
 | `id`                | string   | 64-character hex ID                             |
 | `topic`             | string   | Topic the assessment was generated for          |
+| `context`           | string?  | Context it was generated or selected for        |
+| `style`             | string?  | Style it was written in                         |
 | `locale`            | string   | Language of the questions                       |
 | `questionsPerLevel` | integer  | Questions per difficulty level in this response |
 | `createdAt`         | ISO 8601 | Generation time                                 |

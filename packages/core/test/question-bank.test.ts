@@ -8,7 +8,13 @@ const query = axisVector({ 0: 1 });
 
 function setup() {
   const repo = new InMemoryRepository();
-  const bank = new QuestionBank(repo, new FakeEmbedder(), { margin: 0.08 }, silentLogger, () => NOW);
+  const bank = new QuestionBank(
+    repo,
+    new FakeEmbedder(),
+    { margin: 0.08, strictMargin: 0.12 },
+    silentLogger,
+    () => NOW,
+  );
   const add = (...questions: ReturnType<typeof bankQuestion>[]) => repo.saveQuestions(questions);
   return { repo, bank, add };
 }
@@ -44,6 +50,30 @@ describe('QuestionBank.select', () => {
     const [easy] = await bank.select(query, SCOPE, { 1: 2, 2: 0, 3: 0 });
 
     expect(easy?.map((q) => q.id)).toEqual([`${SCOPE}-1-a`, `${SCOPE}-1-b`]);
+  });
+
+  it('never reuses quarantined questions, and strict mode demands closer matches', async () => {
+    const { repo, bank, add } = setup();
+    const reported = bankQuestion(SCOPE, 1, 'reported', axisVector({ 0: 1 }));
+    await add(
+      reported,
+      bankQuestion(SCOPE, 1, 'close', axisVector({ 0: 0.95, 1: 0.31 })),
+      bankQuestion(SCOPE, 1, 'loose', axisVector({ 0: 0.3, 2: 0.95 })),
+    );
+    await repo.markQuestion(reported, { status: 'quarantined', reports: 2, expiresAt: reported.expiresAt });
+
+    const [auto] = await bank.select(query, SCOPE, { 1: 5, 2: 0, 3: 0 });
+    expect(auto?.map((q) => q.id)).toEqual([`${SCOPE}-1-close`, `${SCOPE}-1-loose`]);
+
+    const strict = new QuestionBank(
+      repo,
+      new FakeEmbedder(),
+      { margin: 0.08, strictMargin: 0.5 },
+      silentLogger,
+      () => NOW,
+    );
+    const [close] = await strict.select(query, SCOPE, { 1: 5, 2: 0, 3: 0 }, 'strict');
+    expect(close?.map((q) => q.id)).toEqual([`${SCOPE}-1-close`]);
   });
 
   it('falls back to no reuse when the bank cannot be searched', async () => {

@@ -7,7 +7,7 @@ import {
   type Firestore,
   type VectorValue,
 } from '@google-cloud/firestore';
-import type { Assessment, BankQuestion, Job } from '../schemas.js';
+import type { Assessment, BankQuestion, Job, QuestionReport } from '../schemas.js';
 import type { AssessmentRepository, LeaseResult, NearestMatch, NewJob, QuestionMatch } from '../ports.js';
 
 const DISTANCE_FIELD = '_distance';
@@ -26,6 +26,7 @@ function toAssessment(snapshot: DocumentSnapshot): Assessment {
     topic: d.topic as string,
     topicNormalized: d.topicNormalized as string,
     context: (d.context as string | null | undefined) ?? null,
+    style: (d.style as string | null | undefined) ?? null,
     locale: d.locale as string,
     scope: d.scope as string,
     questions: d.questions as Assessment['questions'],
@@ -35,6 +36,7 @@ function toAssessment(snapshot: DocumentSnapshot): Assessment {
     embeddingModel: d.embeddingModel as string,
     usage: d.usage as Assessment['usage'],
     reusedQuestions: (d.reusedQuestions as number | undefined) ?? 0,
+    questionIds: (d.questionIds as string[] | undefined) ?? [],
     createdAt: toDate(d.createdAt),
     expiresAt: toDate(d.expiresAt),
   };
@@ -50,8 +52,27 @@ function toBankQuestion(snapshot: DocumentSnapshot): BankQuestion {
     e: d.e as string,
     d: d.d as number,
     scope: d.scope as string,
-    embedding: (d.embedding as VectorValue).toArray(),
-    sourceAssessmentId: d.sourceAssessmentId as string,
+    // Quarantine records created from a report carry no embedding.
+    embedding: (d.embedding as VectorValue | undefined)?.toArray() ?? [],
+    sourceAssessmentId: (d.sourceAssessmentId as string | undefined) ?? '',
+    status: (d.status as BankQuestion['status'] | undefined) ?? 'active',
+    reports: (d.reports as number | undefined) ?? 0,
+    createdAt: toDate(d.createdAt),
+    expiresAt: toDate(d.expiresAt),
+  };
+}
+
+function toReport(snapshot: DocumentSnapshot): QuestionReport {
+  const d = snapshot.data() as DocumentData;
+  return {
+    id: snapshot.id,
+    questionId: d.questionId as string,
+    assessmentId: d.assessmentId as string,
+    accountId: d.accountId as string,
+    reason: d.reason as QuestionReport['reason'],
+    comment: (d.comment as string | null | undefined) ?? null,
+    reused: d.reused as boolean,
+    dismissed: (d.dismissed as boolean | undefined) ?? false,
     createdAt: toDate(d.createdAt),
     expiresAt: toDate(d.expiresAt),
   };
@@ -79,9 +100,11 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
   private readonly aliases: CollectionReference;
   private readonly jobs: CollectionReference;
   private readonly questions: CollectionReference;
+  private readonly reports: CollectionReference;
 
   constructor(private readonly db: Firestore) {
     this.questions = db.collection('questions');
+    this.reports = db.collection('question_reports');
     this.assessments = db.collection('assessments');
     this.aliases = db.collection('topic_keys');
     this.jobs = db.collection('jobs');
@@ -168,19 +191,105 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
   async saveQuestions(questions: readonly BankQuestion[]): Promise<void> {
     for (let start = 0; start < questions.length; start += BATCH_LIMIT) {
       const batch = this.db.batch();
-      for (const { id, embedding, createdAt, expiresAt, ...fields } of questions.slice(
-        start,
-        start + BATCH_LIMIT,
-      )) {
-        batch.set(this.questions.doc(id), {
-          ...fields,
-          embedding: FieldValue.vector(embedding),
-          createdAt: Timestamp.fromDate(createdAt),
-          expiresAt: Timestamp.fromDate(expiresAt),
-        });
+      for (const question of questions.slice(start, start + BATCH_LIMIT)) {
+        // status and reports are left out so a regeneration never clears a quarantine or its reports.
+        const {
+          id,
+          embedding,
+          createdAt,
+          expiresAt,
+          status: _status,
+          reports: _reports,
+          ...fields
+        } = question;
+        batch.set(
+          this.questions.doc(id),
+          {
+            ...fields,
+            embedding: FieldValue.vector(embedding),
+            createdAt: Timestamp.fromDate(createdAt),
+            expiresAt: Timestamp.fromDate(expiresAt),
+          },
+          { merge: true },
+        );
       }
       await batch.commit();
     }
+  }
+
+  recordReport(report: QuestionReport): Promise<boolean> {
+    const ref = this.reports.doc(report.id);
+    return this.db.runTransaction(async (tx) => {
+      if ((await tx.get(ref)).exists) return false;
+      const { id: _id, createdAt, expiresAt, ...fields } = report;
+      tx.create(ref, {
+        ...fields,
+        createdAt: Timestamp.fromDate(createdAt),
+        expiresAt: Timestamp.fromDate(expiresAt),
+      });
+      return true;
+    });
+  }
+
+  async countReports(questionId: string): Promise<number> {
+    const result = await this.reports
+      .where('questionId', '==', questionId)
+      .where('dismissed', '==', false)
+      .count()
+      .get();
+    return result.data().count;
+  }
+
+  async dismissReports(questionId: string): Promise<number> {
+    const result = await this.reports
+      .where('questionId', '==', questionId)
+      .where('dismissed', '==', false)
+      .select()
+      .get();
+    for (let start = 0; start < result.docs.length; start += BATCH_LIMIT) {
+      const batch = this.db.batch();
+      for (const doc of result.docs.slice(start, start + BATCH_LIMIT))
+        batch.update(doc.ref, { dismissed: true });
+      await batch.commit();
+    }
+    return result.docs.length;
+  }
+
+  async markQuestion(
+    question: Pick<BankQuestion, 'id' | 'scope' | 'q' | 'o' | 'a' | 'e' | 'd'>,
+    update: { status: BankQuestion['status']; reports: number; expiresAt: Date },
+  ): Promise<void> {
+    // Only content fields: callers may pass a full bank question, whose plain embedding array would
+    // otherwise overwrite the stored vector.
+    const { id, scope, q, o, a, e, d } = question;
+    await this.questions
+      .doc(id)
+      .set(
+        { scope, q, o, a, e, d, ...update, expiresAt: Timestamp.fromDate(update.expiresAt) },
+        { merge: true },
+      );
+  }
+
+  async expireAssessmentsWith(questionId: string, now: Date): Promise<number> {
+    // expiresAt is exempt from indexing, so already-expired matches are included; re-expiring them is harmless.
+    const result = await this.assessments.where('questionIds', 'array-contains', questionId).select().get();
+    for (let start = 0; start < result.docs.length; start += BATCH_LIMIT) {
+      const batch = this.db.batch();
+      for (const doc of result.docs.slice(start, start + BATCH_LIMIT)) {
+        batch.update(doc.ref, { expiresAt: Timestamp.fromDate(now) });
+      }
+      await batch.commit();
+    }
+    return result.docs.length;
+  }
+
+  async expireAssessment(id: string, now: Date): Promise<void> {
+    await this.assessments.doc(id).update({ expiresAt: Timestamp.fromDate(now) });
+  }
+
+  async listReports(limit: number): Promise<QuestionReport[]> {
+    const result = await this.reports.orderBy('createdAt', 'desc').limit(limit).get();
+    return result.docs.map(toReport);
   }
 
   async getJob(id: string): Promise<Job | null> {

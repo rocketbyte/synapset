@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { Logger } from 'pino';
 import {
+  bankQuestionId,
   bankScopeKey,
   isFresh,
   normalizeTopic,
   requestText,
   scopeKey,
   shuffleOptions,
+  styleKey,
   usableQuestions,
   type LevelCounts,
 } from '../domain.js';
@@ -89,16 +91,21 @@ export class GenerationService {
       const perLevel = message.questionsPerLevel;
       const topicNormalized = normalizeTopic(message.topic);
       const context = message.context ?? null;
+      const style = message.style ?? null;
       const embedding =
         message.embedding ?? (await this.embedder.embed(requestText(topicNormalized, context)));
       const bankScope = bankScopeKey({
         locale: message.locale,
+        style: styleKey(style),
         promptVersion: message.promptVersion,
         embeddingModel: this.embedder.model,
       });
 
-      // Reused questions may have expired since the API chose them; generation covers the gap.
-      const reused = (await this.bank.get(message.reuse ?? [])).filter((q) => q.expiresAt > now);
+      // Reused questions may have expired or been quarantined since the API chose them; generation covers
+      // the gap.
+      const reused = (await this.bank.get(message.reuse ?? [])).filter(
+        (q) => q.status === 'active' && q.expiresAt > now,
+      );
       const reusedByLevel = LEVELS.map((level) => reused.filter((q) => q.d === level).slice(0, perLevel));
       const needed = Object.fromEntries(
         LEVELS.map((level, i) => [level, perLevel - (reusedByLevel[i]?.length ?? 0)]),
@@ -109,16 +116,19 @@ export class GenerationService {
       let costUsd = 0;
       let source = { provider: 'bank', model: 'bank' };
       if (LEVELS.some((level) => needed[level] > 0)) {
-        const result = await this.generate(message, needed, reused, log);
+        const result = await this.generate(message, needed, reused, bankScope, log);
         ({ usage, costUsd } = result);
         source = { provider: result.provider, model: result.model };
         generated = result.questions;
       }
 
-      const questions = LEVELS.flatMap((level, i) => [
-        ...generated.filter(({ question }) => question.d === level).map(({ question }) => question),
-        ...(reusedByLevel[i] ?? []).map(({ q, o, a, e, d }) => ({ q, o, a, e, d })),
+      const ordered = LEVELS.flatMap((level, i) => [
+        ...generated
+          .filter(({ question }) => question.d === level)
+          .map(({ question }) => ({ question, id: bankQuestionId(bankScope, question) })),
+        ...(reusedByLevel[i] ?? []).map(({ id, q, o, a, e, d }) => ({ question: { q, o, a, e, d }, id })),
       ]);
+      const questions = ordered.map(({ question }) => question);
       const expiresAt = new Date(now.getTime() + message.ttlSeconds * 1000);
       await this.repo.saveAssessment(
         {
@@ -126,9 +136,11 @@ export class GenerationService {
           topic: message.topic,
           topicNormalized,
           context,
+          style,
           locale: message.locale,
           scope: scopeKey({
             locale: message.locale,
+            style: styleKey(style),
             questionsPerLevel: perLevel,
             promptVersion: message.promptVersion,
             embeddingModel: this.embedder.model,
@@ -140,6 +152,7 @@ export class GenerationService {
           embeddingModel: this.embedder.model,
           usage,
           reusedQuestions: questions.length - generated.length,
+          questionIds: ordered.map(({ id }) => id),
           createdAt: now,
           expiresAt,
         },
@@ -192,6 +205,7 @@ export class GenerationService {
     message: GenerateMessage,
     needed: LevelCounts,
     reused: readonly BankQuestion[],
+    bankScope: string,
     log: Logger,
   ) {
     const accepted: { question: Question; embedding: number[] }[] = [];
@@ -215,7 +229,7 @@ export class GenerationService {
         ...reused,
         ...accepted.map(({ question, embedding }) => ({ q: question.q, embedding })),
       ];
-      const result = await this.generateRound(message, gap, existing, log);
+      const result = await this.generateRound(message, gap, existing, bankScope, log);
       usage.inputTokens += result.usage.inputTokens;
       usage.outputTokens += result.usage.outputTokens;
       costUsd += result.costUsd;
@@ -245,6 +259,7 @@ export class GenerationService {
     message: GenerateMessage,
     gap: LevelCounts,
     existing: readonly { q: string; embedding: number[] }[],
+    bankScope: string,
     log: Logger,
   ) {
     const { verifyAnswers } = this.options;
@@ -257,6 +272,7 @@ export class GenerationService {
     const result = await this.llm.generate({
       topic: message.topic,
       context: message.context,
+      style: message.style,
       locale: message.locale,
       counts: requested,
       existing: existing.map((question) => question.q),
@@ -265,10 +281,14 @@ export class GenerationService {
     const usage = { ...result.usage };
 
     const existingTexts = new Set(existing.map((question) => question.q.trim().toLowerCase()));
-    let candidates = usableQuestions(result.questions).filter(
+    const fresh = usableQuestions(result.questions).filter(
       (question) =>
         gap[question.d as keyof LevelCounts] > 0 && !existingTexts.has(question.q.trim().toLowerCase()),
     );
+    // Questions users reported into quarantine stay out, even when the model writes them again.
+    const blocked = await this.bank.quarantined(fresh.map((question) => bankQuestionId(bankScope, question)));
+    let candidates = fresh.filter((question) => !blocked.has(bankQuestionId(bankScope, question)));
+    if (blocked.size > 0) log.info({ blocked: blocked.size }, 'Dropped quarantined questions');
     if (verifyAnswers && candidates.length > 0) {
       const verification = await this.llm.verify({ locale: message.locale, questions: candidates });
       costUsd += await this.recordCost(message, verification, log);

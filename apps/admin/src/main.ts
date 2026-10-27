@@ -1,13 +1,26 @@
 #!/usr/bin/env node
 import { randomBytes } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import {
+  BACKGROUND_QUESTIONS,
+  FeedbackService,
+  FirestoreAssessmentRepository,
   FirestoreIdentityRepository,
   PLAN_NAMES,
+  REPORT_REASONS,
   SCOPES,
+  VertexEmbedder,
+  cleanContext,
+  cosine,
   createFirestore,
+  createGenAiClient,
+  createLogger,
   generateApiKey,
   loadConfig,
+  noiseFloor,
+  normalizeTopic,
+  requestText,
   type PlanName,
   type Scope,
 } from '@synapset/core';
@@ -22,6 +35,12 @@ const USAGE = `Usage: pnpm admin <command> [options]
   key list        --account <id>
   key revoke      --key <keyId>
 
+  feedback list       [--limit <n>]        latest question reports
+  feedback summary    [--limit <n>]        reports by reason, reused vs generated
+  question quarantine --question <id>      stop reusing a question and expire assessments using it
+  question restore    --question <id>      reactivate after review and dismiss its reports
+  calibrate           [--file <path>]      measure reuse margins on a labelled set (default calibration.json)
+
 Scopes: ${SCOPES.join(', ')} (default: all)`;
 
 const { positionals, values } = parseArgs({
@@ -33,6 +52,9 @@ const { positionals, values } = parseArgs({
     key: { type: 'string' },
     scopes: { type: 'string' },
     'expires-days': { type: 'string' },
+    question: { type: 'string' },
+    limit: { type: 'string' },
+    file: { type: 'string' },
   },
 });
 
@@ -61,8 +83,22 @@ function scopes(): Scope[] {
   return list as Scope[];
 }
 
-const firestore = createFirestore(loadConfig());
+function limit(fallback: number): number {
+  const value = values.limit ? Number(values.limit) : fallback;
+  if (!(Number.isInteger(value) && value > 0 && value <= 5000))
+    fail('--limit must be an integer from 1 to 5000');
+  return value;
+}
+
+const config = loadConfig();
+const firestore = createFirestore(config);
 const identities = new FirestoreIdentityRepository(firestore);
+const assessments = new FirestoreAssessmentRepository(firestore);
+const feedback = new FeedbackService(
+  assessments,
+  { quarantineAfterReports: config.FEEDBACK_QUARANTINE_REPORTS },
+  createLogger('synapset-admin', 'warn'),
+);
 const now = new Date();
 
 async function account(id: string) {
@@ -129,9 +165,175 @@ async function run(command: string) {
       if (!(await identities.revokeKey(required('key'), now))) fail('Key not found');
       console.error('Revoked. Running instances stop accepting it within 30 seconds.');
       return;
+    case 'feedback list':
+      console.table(
+        (await assessments.listReports(limit(50))).map((r) => ({
+          question: r.questionId.slice(0, 16),
+          reason: r.reason,
+          reused: r.reused,
+          dismissed: r.dismissed,
+          account: r.accountId,
+          at: r.createdAt.toISOString(),
+          comment: r.comment?.slice(0, 60) ?? '',
+        })),
+      );
+      return;
+    case 'feedback summary':
+      summarize(await assessments.listReports(limit(1000)));
+      return;
+    case 'question quarantine': {
+      const outcome = await feedback.quarantine(required('question'));
+      if (outcome.status === 'not_found') fail('Question not found');
+      console.error(
+        `Quarantined. ${String(outcome.expired)} assessments expired and will be rebuilt on demand.`,
+      );
+      return;
+    }
+    case 'question restore': {
+      const outcome = await feedback.restore(required('question'), config.ASSESSMENT_TTL_SECONDS);
+      if (outcome.status === 'not_found') fail('Question not found');
+      console.error(`Restored. ${String(outcome.dismissed)} reports dismissed.`);
+      return;
+    }
+    case 'calibrate':
+      await calibrate(values.file ?? new URL('../calibration.json', import.meta.url).pathname);
+      return;
     default:
       fail(command ? `Unknown command "${command}"` : 'Missing command');
   }
+}
+
+function summarize(reports: Awaited<ReturnType<typeof assessments.listReports>>) {
+  const open = reports.filter((r) => !r.dismissed);
+  console.log(`${String(open.length)} open reports (${String(reports.length - open.length)} dismissed)\n`);
+  console.table(
+    REPORT_REASONS.map((reason) => ({
+      reason,
+      reused: open.filter((r) => r.reason === reason && r.reused).length,
+      generated: open.filter((r) => r.reason === reason && !r.reused).length,
+    })),
+  );
+  // Off-topic reports on reused questions are the direct signal that the reuse margin is too loose.
+  const reused = open.filter((r) => r.reused);
+  const offTopic = reused.filter((r) => r.reason === 'off_topic').length;
+  if (reused.length > 0) {
+    console.log(
+      `off_topic share of reused-question reports: ${pct(offTopic / reused.length)}` +
+        (offTopic / reused.length > 0.25 ? ' (high: consider raising QUESTION_REUSE_MARGIN)' : ''),
+    );
+  }
+}
+
+interface CalibrationCase {
+  topic: string;
+  context?: string;
+  related: string[];
+  unrelated: string[];
+}
+
+function parseCases(raw: unknown): CalibrationCase[] {
+  const cases = (raw as { cases?: unknown }).cases;
+  const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === 'string');
+  if (
+    !Array.isArray(cases) ||
+    cases.length === 0 ||
+    !cases.every(
+      (c: Partial<CalibrationCase>) =>
+        typeof c.topic === 'string' &&
+        (c.context === undefined || typeof c.context === 'string') &&
+        strings(c.related) &&
+        strings(c.unrelated),
+    )
+  )
+    fail('Calibration file must be {"cases": [{"topic", "context"?, "related": [], "unrelated": []}]}');
+  return cases as CalibrationCase[];
+}
+
+/**
+ * Scores every labelled pair with the live embedding model and the same noise-floor rule the bank uses,
+ * then reports precision (reused questions that belong) and recall (belonging questions reused) per margin.
+ */
+async function calibrate(file: string) {
+  const cases = parseCases(JSON.parse(await readFile(file, 'utf8')));
+  const embedder = new VertexEmbedder(
+    createGenAiClient(config.GCP_PROJECT_ID, config.VERTEX_LOCATION),
+    config.EMBEDDING_MODEL,
+  );
+  const texts = [
+    ...BACKGROUND_QUESTIONS,
+    ...cases.flatMap((c) => [
+      requestText(normalizeTopic(c.topic), cleanContext(c.context)),
+      ...c.related,
+      ...c.unrelated,
+    ]),
+  ];
+  const vectors = await embedAll(embedder, texts);
+  const background = vectors.slice(0, BACKGROUND_QUESTIONS.length);
+
+  const pairs: { excess: number; related: boolean; label: string }[] = [];
+  let offset = BACKGROUND_QUESTIONS.length;
+  for (const c of cases) {
+    const query = vectors[offset++] as number[];
+    const floor = noiseFloor(query, background);
+    for (const [items, related] of [
+      [c.related, true],
+      [c.unrelated, false],
+    ] as const) {
+      for (const text of items) {
+        const excess = cosine(query, vectors[offset++] as number[]) - floor;
+        pairs.push({ excess, related, label: `${c.topic}${c.context ? ` / ${c.context}` : ''}: ${text}` });
+      }
+    }
+  }
+
+  const rows = Array.from({ length: 11 }, (_, i) => {
+    const margin = Math.round(i * 0.02 * 100) / 100;
+    const reused = pairs.filter((p) => p.excess >= margin);
+    const correct = reused.filter((p) => p.related).length;
+    return {
+      margin,
+      precision: reused.length ? correct / reused.length : 1,
+      recall: correct / pairs.filter((p) => p.related).length,
+    };
+  });
+  console.log(`${config.EMBEDDING_MODEL}, ${String(cases.length)} cases, ${String(pairs.length)} pairs\n`);
+  console.table(rows.map((r) => ({ margin: r.margin, precision: pct(r.precision), recall: pct(r.recall) })));
+
+  const auto = rows.find((r) => r.precision >= 0.95);
+  const strict = rows.find((r) => r.precision >= 1 && r.margin >= (auto?.margin ?? 0));
+  console.log(
+    `current: QUESTION_REUSE_MARGIN=${String(config.QUESTION_REUSE_MARGIN)} ` +
+      `QUESTION_REUSE_STRICT_MARGIN=${String(config.QUESTION_REUSE_STRICT_MARGIN)}`,
+  );
+  console.log(
+    `suggested: QUESTION_REUSE_MARGIN=${auto ? String(auto.margin) : 'none reaches 95% precision'} ` +
+      `QUESTION_REUSE_STRICT_MARGIN=${strict ? String(strict.margin) : 'none reaches 100% precision'}`,
+  );
+
+  const margin = config.QUESTION_REUSE_MARGIN;
+  const wrong = pairs.filter((p) => p.excess >= margin !== p.related);
+  if (wrong.length > 0) {
+    console.log(`\nMisjudged at the current margin (${String(margin)}):`);
+    for (const p of wrong)
+      console.log(`  ${p.related ? 'missed  ' : 'reused  '} ${p.excess.toFixed(3)}  ${p.label}`);
+  }
+}
+
+async function embedAll(embedder: VertexEmbedder, texts: readonly string[]): Promise<number[][]> {
+  const vectors = new Array<number[]>(texts.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < texts.length) {
+      const i = next++;
+      vectors[i] = await embedder.embed(texts[i] as string);
+    }
+  };
+  await Promise.all(Array.from({ length: 8 }, worker));
+  return vectors;
+}
+
+function pct(value: number): string {
+  return `${(value * 100).toFixed(0)}%`;
 }
 
 try {

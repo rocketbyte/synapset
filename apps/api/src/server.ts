@@ -15,8 +15,11 @@ import {
   BudgetExhaustedError,
   LocaleSchema,
   MAX_CONTEXT_LENGTH,
+  MAX_STYLE_LENGTH,
   MAX_TOPIC_LENGTH,
   QuotaExceededError,
+  REPORT_REASONS,
+  REUSE_MODES,
   TransientError,
   counterKeys,
   endOfUtcDay,
@@ -26,6 +29,7 @@ import {
   type AssessmentService,
   type Authenticator,
   type Clock,
+  type FeedbackService,
   type Job,
   type LimitStore,
   type Logger,
@@ -36,6 +40,7 @@ import { DOCS_PREFIX, registerSecurity } from './security.js';
 
 export interface ServerOptions {
   service: AssessmentService;
+  feedback: FeedbackService;
   authenticator: Authenticator;
   limits: LimitStore;
   usage: UsageRecorder;
@@ -82,9 +87,25 @@ const ResolveBody = z.strictObject({
     .max(MAX_CONTEXT_LENGTH)
     .optional()
     .describe(
-      'Guidance for the assessment: what to focus on, the audience, what to emphasise or avoid. Different context is a different assessment.',
+      'What to cover: focus areas, emphasis, what to avoid. Also steers which existing questions are reused. Different context is a different assessment.',
     )
     .meta({ example: 'Focus on taxes: deductions, credits and how income tax is calculated.' }),
+  style: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_STYLE_LENGTH)
+    .optional()
+    .describe(
+      'How to write: audience, tone, reading level, question format. Existing questions are reused only from assessments written in the same style.',
+    )
+    .meta({ example: 'For high-school students; use short real-life scenarios.' }),
+  reuse: z
+    .enum(REUSE_MODES)
+    .default('auto')
+    .describe(
+      'auto: reuse relevant existing questions. strict: reuse only very close matches. off: always generate new questions (costs a generation).',
+    ),
   locale: LocaleSchema.default('en').describe('Language of the questions'),
   ttlSeconds: z
     .number()
@@ -108,10 +129,36 @@ const GradeBody = z.strictObject({
     .meta({ example: [0, 2, null, 1] }),
 });
 
+const MAX_COMMENT_LENGTH = 500;
+const FeedbackBody = z.strictObject({
+  questionsPerLevel: QuestionsPerLevel.optional().describe(
+    'The count the assessment was fetched with; i is a position in that selection',
+  ),
+  i: z.number().int().min(0).describe('Index of the question being reported'),
+  reason: z.enum(REPORT_REASONS),
+  comment: z
+    .string()
+    .trim()
+    .max(MAX_COMMENT_LENGTH)
+    .optional()
+    .describe('Free text for reviewers. Stored only; never sent to a model.'),
+});
+const FeedbackView = z
+  .object({
+    status: z
+      .enum(['recorded', 'duplicate'])
+      .describe('duplicate: this account already reported the question; nothing changed'),
+    quarantined: z
+      .boolean()
+      .describe('The question has enough reports to be withdrawn from reuse and from cached assessments'),
+  })
+  .describe('Report accepted');
+
 const AssessmentView = z.object({
   id: Id,
   topic: z.string(),
   context: z.string().nullable(),
+  style: z.string().nullable(),
   locale: z.string(),
   questionsPerLevel: z.number().int().describe('Questions per difficulty level in this response'),
   createdAt: z.iso.datetime(),
@@ -209,6 +256,7 @@ const presentAssessment = (service: AssessmentService, a: Assessment, perLevel: 
   id: a.id,
   topic: a.topic,
   context: a.context,
+  style: a.style,
   locale: a.locale,
   questionsPerLevel: perLevel,
   createdAt: a.createdAt.toISOString(),
@@ -459,6 +507,44 @@ export async function buildServer(options: ServerOptions) {
         });
       }
       return reply.code(200).send(service.grade(assessment, count, answers));
+    },
+  );
+
+  app.post(
+    '/v1/assessments/:id/feedback',
+    {
+      config: { scope: 'assessments:read' },
+      schema: {
+        operationId: 'reportQuestion',
+        tags: ['Assessments'],
+        summary: 'Report a question',
+        description:
+          'Flags a question as wrong, ambiguous, off-topic or outdated. Each account can report a question once. A question reported by enough distinct accounts is withdrawn: it is never reused, and cached assessments containing it are rebuilt without it on their next request.',
+        params: IdParams,
+        body: FeedbackBody,
+        response: { 202: FeedbackView, ...errors(400, 401, 403, 404, 429) },
+      },
+    },
+    async (request, reply) => {
+      const { questionsPerLevel, i, reason, comment } = request.body;
+      const count = perLevel(questionsPerLevel);
+      const assessment = await service.get(request.params.id);
+      if (!assessment) return sendProblem(reply, { status: 404, code: 'not_found' });
+      const outcome = await options.feedback.report(
+        { assessment, questionsPerLevel: count, index: i, reason, comment: comment || undefined },
+        request.principal as NonNullable<typeof request.principal>,
+      );
+      if (outcome.status === 'not_found') {
+        return sendProblem(reply, {
+          status: 400,
+          code: 'invalid_request',
+          detail: `i must be below ${service.questionsFor(assessment, count).length}`,
+        });
+      }
+      return reply.code(202).send({
+        status: outcome.status,
+        quarantined: outcome.status === 'recorded' && outcome.quarantined,
+      });
     },
   );
 

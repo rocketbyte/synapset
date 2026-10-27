@@ -11,6 +11,7 @@ import {
   type BankQuestion,
   type PromptInput,
   type QuestionMatch,
+  type QuestionReport,
   type IdentityRepository,
   type PlanLimits,
   type Principal,
@@ -49,6 +50,7 @@ export function assessment(overrides: Partial<Assessment> = {}): Assessment {
     topic: 'TypeScript generics',
     topicNormalized: 'typescript generics',
     context: null,
+    style: null,
     locale: 'en',
     scope: 'scope',
     questions: questions(1),
@@ -58,6 +60,7 @@ export function assessment(overrides: Partial<Assessment> = {}): Assessment {
     embeddingModel: 'fake-embedding',
     usage: { inputTokens: 1, outputTokens: 1 },
     reusedQuestions: 0,
+    questionIds: [],
     createdAt: new Date('2026-10-01T00:00:00Z'),
     expiresAt: new Date('2026-11-01T00:00:00Z'),
     ...overrides,
@@ -182,8 +185,64 @@ export class InMemoryRepository implements AssessmentRepository {
     return Promise.resolve(ids.flatMap((id) => this.bank.get(id) ?? []));
   }
   saveQuestions(questions: readonly BankQuestion[]) {
-    for (const question of questions) this.bank.set(question.id, question);
+    for (const question of questions) {
+      const existing = this.bank.get(question.id);
+      this.bank.set(question.id, {
+        ...question,
+        status: existing?.status ?? 'active',
+        reports: existing?.reports ?? 0,
+      });
+    }
     return Promise.resolve();
+  }
+  reports = new Map<string, QuestionReport>();
+  recordReport(report: QuestionReport) {
+    if (this.reports.has(report.id)) return Promise.resolve(false);
+    this.reports.set(report.id, report);
+    return Promise.resolve(true);
+  }
+  countReports(questionId: string) {
+    return Promise.resolve(
+      [...this.reports.values()].filter((r) => r.questionId === questionId && !r.dismissed).length,
+    );
+  }
+  dismissReports(questionId: string) {
+    const open = [...this.reports.values()].filter((r) => r.questionId === questionId && !r.dismissed);
+    for (const report of open) this.reports.set(report.id, { ...report, dismissed: true });
+    return Promise.resolve(open.length);
+  }
+  markQuestion(
+    question: Pick<BankQuestion, 'id' | 'scope' | 'q' | 'o' | 'a' | 'e' | 'd'>,
+    update: { status: BankQuestion['status']; reports: number; expiresAt: Date },
+  ) {
+    const existing = this.bank.get(question.id);
+    this.bank.set(question.id, {
+      embedding: [],
+      sourceAssessmentId: '',
+      createdAt: update.expiresAt,
+      ...existing,
+      ...question,
+      ...update,
+    });
+    return Promise.resolve();
+  }
+  expireAssessmentsWith(questionId: string, now: Date) {
+    let count = 0;
+    for (const [id, a] of this.assessments) {
+      if (a.questionIds.includes(questionId)) {
+        this.assessments.set(id, { ...a, expiresAt: now });
+        count++;
+      }
+    }
+    return Promise.resolve(count);
+  }
+  expireAssessment(id: string, now: Date) {
+    const a = this.assessments.get(id);
+    if (a) this.assessments.set(id, { ...a, expiresAt: now });
+    return Promise.resolve();
+  }
+  listReports(limit: number) {
+    return Promise.resolve([...this.reports.values()].slice(-limit).reverse());
   }
   getAlias(key: string) {
     return Promise.resolve(this.aliases.get(key) ?? null);
@@ -316,6 +375,8 @@ export function bankQuestion(
     scope,
     embedding,
     sourceAssessmentId: 'src',
+    status: 'active',
+    reports: 0,
     createdAt: new Date('2026-10-01T00:00:00Z'),
     expiresAt,
   };

@@ -4,15 +4,17 @@ import {
   cleanContext,
   isFresh,
   normalizeTopic,
+  requestIdentity,
   requestText,
   scopeKey,
   selectQuestions,
+  styleKey,
   uniformCounts,
   type GenerationScope,
 } from '../domain.js';
 import type { Principal } from '../auth.js';
 import { PROMPT_VERSION } from '../prompt.js';
-import type { Assessment, BankQuestion, Job } from '../schemas.js';
+import type { Assessment, BankQuestion, Job, ReuseMode } from '../schemas.js';
 import type {
   AssessmentCache,
   AssessmentRepository,
@@ -36,8 +38,12 @@ export interface AssessmentServiceOptions {
 
 export interface ResolveInput {
   topic: string;
-  /** Guidance on focus, audience or emphasis; part of what identifies the assessment. */
+  /** What to cover: focus areas, emphasis, what to avoid. Part of what identifies the assessment. */
   context?: string | undefined;
+  /** How to write: audience, tone, format. Bank questions are reused only within the same style. */
+  style?: string | undefined;
+  /** `strict` reuses only very close questions; `off` never reuses and always generates. Default `auto`. */
+  reuse?: ReuseMode | undefined;
   locale: string;
   ttlSeconds?: number | undefined;
 }
@@ -87,27 +93,32 @@ export class AssessmentService {
     const now = this.clock();
     const topicNormalized = normalizeTopic(input.topic);
     const context = cleanContext(input.context);
-    const text = requestText(topicNormalized, context);
+    const style = cleanContext(input.style);
+    const reuseMode = input.reuse ?? 'auto';
     const scope: GenerationScope = {
       locale: input.locale,
+      style: styleKey(style),
       questionsPerLevel: this.options.questionsPerLevel,
       promptVersion: PROMPT_VERSION,
       embeddingModel: this.embedder.model,
     };
-    const key = cacheKey(text, scope);
+    const key = cacheKey(requestIdentity({ topicNormalized, context, style, reuse: reuseMode }), scope);
 
     const exact = await this.findExact(key, now);
     if (exact) return { status: 'ready', assessment: exact, match: 'exact' };
 
-    const embedding = await this.embedder.embed(text);
-    const nearest = (
-      await this.repo.findNearest(
-        embedding,
-        scopeKey(scope),
-        1 - this.options.similarityThreshold,
-        NEAREST_CANDIDATES,
-      )
-    ).find((match) => isFresh(match.assessment, now));
+    const embedding = await this.embedder.embed(requestText(topicNormalized, context));
+    const nearest =
+      reuseMode === 'off'
+        ? undefined
+        : (
+            await this.repo.findNearest(
+              embedding,
+              scopeKey(scope),
+              1 - this.options.similarityThreshold,
+              NEAREST_CANDIDATES,
+            )
+          ).find((match) => isFresh(match.assessment, now));
     if (nearest) {
       await this.repo.saveAlias(key, nearest.assessment.id, nearest.assessment.expiresAt);
       this.cache?.set(key, nearest.assessment);
@@ -115,29 +126,40 @@ export class AssessmentService {
     }
 
     const perLevel = this.options.questionsPerLevel;
-    const reuse = this.bank
-      ? await this.bank.select(
-          embedding,
-          bankScopeKey({
-            locale: input.locale,
-            promptVersion: PROMPT_VERSION,
-            embeddingModel: this.embedder.model,
-          }),
-          uniformCounts(perLevel),
-        )
-      : [];
+    const reuse =
+      this.bank && reuseMode !== 'off'
+        ? await this.bank.select(
+            embedding,
+            bankScopeKey({
+              locale: input.locale,
+              style: scope.style,
+              promptVersion: PROMPT_VERSION,
+              embeddingModel: this.embedder.model,
+            }),
+            uniformCounts(perLevel),
+            reuseMode,
+          )
+        : [];
     const ttlSeconds = Math.min(
       input.ttlSeconds ?? this.options.defaultTtlSeconds,
       this.options.maxTtlSeconds,
     );
     if (reuse.length > 0 && reuse.every((level) => level.length === perLevel)) {
-      const assessment = composeAssessment(key, input.topic.trim(), topicNormalized, context, input.locale, {
-        scope: scopeKey(scope),
-        embeddingModel: this.embedder.model,
-        questions: reuse.flat(),
-        now,
-        ttlSeconds,
-      });
+      const assessment = composeAssessment(
+        key,
+        input.topic.trim(),
+        topicNormalized,
+        context,
+        style,
+        input.locale,
+        {
+          scope: scopeKey(scope),
+          embeddingModel: this.embedder.model,
+          questions: reuse.flat(),
+          now,
+          ttlSeconds,
+        },
+      );
       await this.repo.saveAssessment(assessment, embedding);
       this.cache?.set(key, assessment);
       return { status: 'ready', assessment, match: 'composed' };
@@ -164,6 +186,7 @@ export class AssessmentService {
           accountId: requester.accountId,
           topic: job.topic,
           ...(context ? { context } : {}),
+          ...(style ? { style } : {}),
           locale: input.locale,
           questionsPerLevel: scope.questionsPerLevel,
           promptVersion: PROMPT_VERSION,
@@ -234,6 +257,7 @@ function composeAssessment(
   topic: string,
   topicNormalized: string,
   context: string | null,
+  style: string | null,
   locale: string,
   parts: { scope: string; embeddingModel: string; questions: BankQuestion[]; now: Date; ttlSeconds: number },
 ): Assessment {
@@ -242,6 +266,7 @@ function composeAssessment(
     topic,
     topicNormalized,
     context,
+    style,
     locale,
     scope: parts.scope,
     questions: parts.questions.map(({ q, o, a, e, d }) => ({ q, o, a, e, d })),
@@ -251,6 +276,7 @@ function composeAssessment(
     embeddingModel: parts.embeddingModel,
     usage: { inputTokens: 0, outputTokens: 0 },
     reusedQuestions: parts.questions.length,
+    questionIds: parts.questions.map((question) => question.id),
     createdAt: parts.now,
     expiresAt: new Date(parts.now.getTime() + parts.ttlSeconds * 1000),
   };

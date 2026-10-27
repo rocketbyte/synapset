@@ -36,6 +36,10 @@ const ConfigSchema = z.object({
    * gemini-embedding-2: 0.08 kept 96% precision at 59% recall; lower reuses more, less precisely.
    */
   QUESTION_REUSE_MARGIN: z.coerce.number().min(0).max(0.5).default(0.08),
+  /** Margin for requests with reuse "strict": 0.12 kept 100% precision at ~30% recall in calibration. */
+  QUESTION_REUSE_STRICT_MARGIN: z.coerce.number().min(0).max(0.5).default(0.12),
+  /** Distinct accounts that must report a question before it is quarantined. */
+  FEEDBACK_QUARANTINE_REPORTS: z.coerce.number().int().min(1).default(2),
   /** Blind-answer every generated question and drop those whose key the model disputes. */
   VERIFY_ANSWERS: z
     .enum(['true', 'false'])
@@ -79,6 +83,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const config = result.data;
   if (config.JOB_STALE_SECONDS <= config.JOB_LEASE_SECONDS) {
     throw new Error('Invalid configuration: JOB_STALE_SECONDS must exceed JOB_LEASE_SECONDS');
+  }
+  if (config.QUESTION_REUSE_STRICT_MARGIN < config.QUESTION_REUSE_MARGIN) {
+    throw new Error('Invalid configuration: QUESTION_REUSE_STRICT_MARGIN is below QUESTION_REUSE_MARGIN');
   }
   if (config.ASSESSMENT_TTL_SECONDS > config.ASSESSMENT_MAX_TTL_SECONDS) {
     throw new Error('Invalid configuration: ASSESSMENT_TTL_SECONDS exceeds ASSESSMENT_MAX_TTL_SECONDS');
