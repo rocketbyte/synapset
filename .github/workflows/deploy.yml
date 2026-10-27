@@ -1,0 +1,80 @@
+name: Deploy
+
+# Every green CI run on main deploys to dev. Prod then promotes the same image digests (never a rebuild)
+# once a reviewer approves the "prod" GitHub Environment. Each GitHub Environment holds its own variables:
+# GCP_REGION, ARTIFACT_REGISTRY, WORKLOAD_IDENTITY_PROVIDER, DEPLOYER_SERVICE_ACCOUNT
+# (prod also PROMOTE_FROM_REGISTRY: dev's ARTIFACT_REGISTRY). Set the repository variable
+# PROD_ENABLED=true once prod exists.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  dev:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        app: [api, worker]
+    env:
+      IMAGE: ${{ vars.ARTIFACT_REGISTRY }}/${{ matrix.app }}:${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3
+      - run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          build-args: APP=${{ matrix.app }}
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+      - run: >
+          gcloud run services update "synapset-dev-${{ matrix.app }}"
+          --region "${{ vars.GCP_REGION }}" --image "$IMAGE" --quiet
+
+  prod:
+    needs: dev
+    if: vars.PROD_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        app: [api, worker]
+    env:
+      SOURCE: ${{ vars.PROMOTE_FROM_REGISTRY }}/${{ matrix.app }}:${{ github.event.workflow_run.head_sha }}
+      IMAGE: ${{ vars.ARTIFACT_REGISTRY }}/${{ matrix.app }}:${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3
+      - run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+      - uses: docker/setup-buildx-action@v4
+      # Copies the manifest by digest, so prod runs exactly the bytes that were verified in dev.
+      - run: docker buildx imagetools create --tag "$IMAGE" "$SOURCE"
+      - run: >
+          gcloud run services update "synapset-prod-${{ matrix.app }}"
+          --region "${{ vars.GCP_REGION }}" --image "$IMAGE" --quiet

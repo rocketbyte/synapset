@@ -1,0 +1,8 @@
+project_id        = "synapset-dev"
+environment       = "dev"
+region            = "us-central1"
+github_repository = "rocketbyte/synapset"
+llm_daily_budget_usd = 5
+# api_domain         = "api.dev.example.com"
+# alert_email        = "oncall@example.com"
+# billing_account_id = "000000-000000-000000"

@@ -1,0 +1,19 @@
+{
+  "name": "@synapset/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js",
+    "dev": "PORT=8081 tsx watch --env-file-if-exists=../../.env src/main.ts"
+  },
+  "dependencies": {
+    "@synapset/core": "workspace:*",
+    "fastify": "^5.12.7",
+    "zod": "^4.6.7"
+  },
+  "files": [
+    "dist"
+  ]
+}

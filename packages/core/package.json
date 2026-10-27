@@ -1,0 +1,25 @@
+{
+  "name": "@synapset/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "@google-cloud/firestore": "^9.4.0",
+    "@google-cloud/pubsub": "^6.3.1",
+    "@google/genai": "^2.31.0",
+    "ioredis": "^6.0.0",
+    "lru-cache": "^11.5.3",
+    "pino": "^10.4.0",
+    "zod": "^4.6.7"
+  }
+}

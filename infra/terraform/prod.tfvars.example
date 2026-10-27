@@ -1,0 +1,23 @@
+project_id        = "synapset-prod"
+environment       = "prod"
+region            = "us-central1"
+github_repository = "<owner>/<repo>"
+
+llm_daily_budget_usd = 50
+alert_email          = "oncall@example.com"
+billing_account_id   = "000000-000000-000000"
+monthly_budget_usd   = 300
+firestore_backups    = true
+
+# Images are promoted from dev, never rebuilt for prod.
+promote_from_repository = {
+  project    = "synapset-dev"
+  location   = "us-central1"
+  repository = "synapset-dev"
+}
+
+# Turn on when traffic justifies the fixed cost (README "Cost profile"):
+# redis_enabled = true
+# redis_tier    = "STANDARD_HA"
+# api_domain    = "api.example.com"
+# waf_preview   = false   # after reviewing WAF logs
