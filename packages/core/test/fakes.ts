@@ -18,6 +18,8 @@ import {
   type JobQueue,
   type LeaseResult,
   type LlmProvider,
+  type VerificationResult,
+  type VerifyInput,
   type NearestMatch,
   type NewJob,
   type Question,
@@ -78,13 +80,39 @@ export class FakeQueue implements JobQueue {
   }
 }
 
+/** By default the checker agrees with every answer key it is shown. */
 export class FakeLlm implements LlmProvider {
   readonly name = 'anthropic';
   calls = 0;
-  constructor(private readonly behaviour: () => Promise<GenerationResult>) {}
-  generate(): Promise<GenerationResult> {
+  verifyCalls = 0;
+  generatedPerLevel: number[] = [];
+  private generated: Question[] = [];
+
+  constructor(
+    private readonly behaviour: () => Promise<GenerationResult>,
+    private readonly dispute: (question: Question) => boolean = () => false,
+  ) {}
+
+  async generate(input: { questionsPerLevel: number }): Promise<GenerationResult> {
     this.calls++;
-    return this.behaviour();
+    this.generatedPerLevel.push(input.questionsPerLevel);
+    const result = await this.behaviour();
+    this.generated = result.questions;
+    return result;
+  }
+
+  verify(input: VerifyInput): Promise<VerificationResult> {
+    this.verifyCalls++;
+    const verdicts = input.questions.map(({ q }, i) => {
+      const question = this.generated.find((candidate) => candidate.q === q) as Question;
+      return { i, a: question.a, ok: !this.dispute(question) };
+    });
+    return Promise.resolve({
+      verdicts,
+      provider: 'anthropic',
+      model: 'claude-haiku-5-5',
+      usage: { inputTokens: 100, outputTokens: 100 },
+    });
   }
 }
 

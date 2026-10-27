@@ -55,6 +55,17 @@ const Id = z
   .meta({ example: '3f9a1c0e5b7d2a4c6e8f0a1b3c5d7e9f1a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d' });
 const IdParams = z.strictObject({ id: Id });
 
+const MAX_QUESTIONS_PER_LEVEL = 20;
+const QuestionsPerLevel = z
+  .number()
+  .int()
+  .min(1)
+  .max(MAX_QUESTIONS_PER_LEVEL)
+  .describe(
+    "Questions per difficulty level (three levels). Defaults to the server's maximum, which GET /v1/usage reports.",
+  )
+  .meta({ example: 5 });
+
 const ResolveBody = z.strictObject({
   topic: z
     .string()
@@ -70,8 +81,15 @@ const ResolveBody = z.strictObject({
     .min(3600)
     .optional()
     .describe('How long a newly generated assessment stays cached. Capped by the server.'),
+  questionsPerLevel: QuestionsPerLevel.optional(),
+});
+const AssessmentQuery = z.strictObject({
+  questionsPerLevel: z.coerce.number().pipe(QuestionsPerLevel).optional(),
 });
 const GradeBody = z.strictObject({
+  questionsPerLevel: QuestionsPerLevel.optional().describe(
+    'The count the assessment was fetched with; answers follow that selection',
+  ),
   answers: z
     .array(z.number().int().min(0).max(3).nullable())
     .max(200)
@@ -83,6 +101,7 @@ const AssessmentView = z.object({
   id: Id,
   topic: z.string(),
   locale: z.string(),
+  questionsPerLevel: z.number().int().describe('Questions per difficulty level in this response'),
   createdAt: z.iso.datetime(),
   expiresAt: z.iso.datetime().describe('After this the assessment is regenerated on the next request'),
   questions: z
@@ -140,6 +159,9 @@ const UsageView = z
       burst: z.number().int(),
       maxConcurrent: z.number().int(),
     }),
+    assessments: z.object({
+      maxQuestionsPerLevel: z.number().int().describe('Highest questionsPerLevel a request may ask for'),
+    }),
   })
   .describe('Usage against the plan');
 const ProblemView = z
@@ -158,18 +180,23 @@ const API_DESCRIPTION = `Turns a topic into a multiple-choice knowledge assessme
 
 **Asynchronous generation.** \`POST /v1/assessments\` answers \`200\` when the topic is cached. On a miss it answers \`202\` with a job: poll \`GET /v1/jobs/{id}\` (honouring \`Retry-After\`) until it is \`done\`, then fetch \`GET /v1/assessments/{assessmentId}\`.
 
+**Question count.** Pass \`questionsPerLevel\` to get fewer questions than the server generates (three difficulty levels, so \`5\` returns 15). Each topic is generated once at the maximum, so any count is served from the same cached assessment. Use the same count when fetching and grading.
+
+**Answer checking.** Before an assessment is stored, a second model pass answers every question without the key. Questions it answers differently, or finds ambiguous, are discarded.
+
 **Limits.** Every authenticated response carries \`RateLimit-Limit\`, \`RateLimit-Remaining\` and \`RateLimit-Reset\`. A \`429\` or \`503\` carries \`Retry-After\`.
 
 **Errors.** Failures are \`application/problem+json\` (RFC 9457) with a stable \`code\` and a \`request_id\` that matches the \`X-Request-Id\` header.`;
 
 /** Answers and explanations are only released by grading. */
-const presentAssessment = (a: Assessment) => ({
+const presentAssessment = (service: AssessmentService, a: Assessment, perLevel: number) => ({
   id: a.id,
   topic: a.topic,
   locale: a.locale,
+  questionsPerLevel: perLevel,
   createdAt: a.createdAt.toISOString(),
   expiresAt: a.expiresAt.toISOString(),
-  questions: a.questions.map(({ q, o, d }, i) => ({ i, q, o, d })),
+  questions: service.questionsFor(a, perLevel).map(({ q, o, d }, i) => ({ i, q, o, d })),
 });
 
 /** Internal error text stays in the logs; clients get a stable code. */
@@ -192,6 +219,20 @@ const errors = (...codes: number[]) => Object.fromEntries(codes.map((code) => [c
 export async function buildServer(options: ServerOptions) {
   const { service, limits, projectId } = options;
   const clock = options.clock ?? (() => new Date());
+
+  /** Requests may ask for fewer questions than were generated, never more. */
+  const perLevel = (requested: number | undefined) => {
+    const max = service.maxQuestionsPerLevel;
+    if (requested === undefined) return max;
+    if (requested > max) {
+      throw new ProblemError({
+        status: 400,
+        code: 'invalid_request',
+        detail: `questionsPerLevel must be at most ${max}`,
+      });
+    }
+    return requested;
+  };
 
   const app = Fastify({
     loggerInstance: options.logger,
@@ -321,12 +362,13 @@ export async function buildServer(options: ServerOptions) {
         tags: ['Assessments'],
         summary: 'Resolve a topic',
         description:
-          'Returns the cached assessment for the topic, matched verbatim or by meaning. On a miss, queues a generation and returns the job. Only a miss counts against the daily generation quota.',
+          'Returns the cached assessment for the topic, matched verbatim or by meaning. On a miss, queues a generation and returns the job. Only a miss counts against the daily generation quota.\n\nEvery topic is generated once at the maximum size, so any questionsPerLevel up to it is served from the same cached assessment, at no extra generation cost. Pass the same questionsPerLevel when fetching and grading it.',
         body: ResolveBody,
         response: { 200: ReadyView, 202: JobView, ...errors(400, 401, 403, 429, 503) },
       },
     },
     async (request, reply) => {
+      const count = perLevel(request.body.questionsPerLevel);
       const result = await service.resolve(
         request.body,
         request.principal as NonNullable<typeof request.principal>,
@@ -336,7 +378,7 @@ export async function buildServer(options: ServerOptions) {
         return reply.code(200).send({
           status: 'ready' as const,
           match: result.match,
-          assessment: presentAssessment(result.assessment),
+          assessment: presentAssessment(service, result.assessment, count),
         });
       }
       request.generationQueued = true;
@@ -356,15 +398,18 @@ export async function buildServer(options: ServerOptions) {
         operationId: 'getAssessment',
         tags: ['Assessments'],
         summary: 'Get an assessment',
-        description: 'Questions and options only; answers and explanations are released by grading.',
+        description:
+          'Questions and options only; answers and explanations are released by grading. A given questionsPerLevel always returns the same questions, in the same order.',
         params: IdParams,
-        response: { 200: AssessmentView, ...errors(401, 403, 404, 429) },
+        querystring: AssessmentQuery,
+        response: { 200: AssessmentView, ...errors(400, 401, 403, 404, 429) },
       },
     },
     async (request, reply) => {
+      const count = perLevel(request.query.questionsPerLevel);
       const assessment = await service.get(request.params.id);
       if (!assessment) return sendProblem(reply, { status: 404, code: 'not_found' });
-      return reply.code(200).send(presentAssessment(assessment));
+      return reply.code(200).send(presentAssessment(service, assessment, count));
     },
   );
 
@@ -384,17 +429,19 @@ export async function buildServer(options: ServerOptions) {
       },
     },
     async (request, reply) => {
+      const count = perLevel(request.body.questionsPerLevel);
       const assessment = await service.get(request.params.id);
       if (!assessment) return sendProblem(reply, { status: 404, code: 'not_found' });
       const { answers } = request.body;
-      if (answers.length !== assessment.questions.length) {
+      const expected = service.questionsFor(assessment, count).length;
+      if (answers.length !== expected) {
         return sendProblem(reply, {
           status: 400,
           code: 'invalid_request',
-          detail: `Expected ${assessment.questions.length} answers, got ${answers.length}`,
+          detail: `Expected ${expected} answers, got ${answers.length}`,
         });
       }
-      return reply.code(200).send(service.grade(assessment, answers));
+      return reply.code(200).send(service.grade(assessment, count, answers));
     },
   );
 
@@ -459,6 +506,7 @@ export async function buildServer(options: ServerOptions) {
           burst: plan.burst,
           maxConcurrent: plan.maxConcurrentRequests,
         },
+        assessments: { maxQuestionsPerLevel: service.maxQuestionsPerLevel },
       });
     },
   );

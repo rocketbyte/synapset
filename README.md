@@ -22,6 +22,8 @@ Client ─▶ api (Cloud Run, public)
 - **Semantic match:** cosine similarity ≥ `SIMILARITY_THRESHOLD` (0.88) within the same scope. A match is saved as an alias, so the next identical request is an exact hit.
 - **Expiry:** `expiresAt` is checked on every read; an expired assessment is regenerated in full. Firestore TTL deletes old documents later (typically within 24 hours).
 - **Deduplication:** concurrent misses share one job; the worker's lease and idempotent writes make Pub/Sub redeliveries harmless.
+- **Question count:** every topic is generated once with `QUESTIONS_PER_LEVEL` questions per level (default 10, max 20). Callers pass `questionsPerLevel` to receive the first N per level of the same cached assessment, so the count never multiplies generations.
+- **Answer check:** with `VERIFY_ANSWERS=true` (default), the worker generates about 25% spare questions, has the model answer each one blind, and keeps only those whose key it confirms and judges unambiguous. Too few survivors fails the attempt, and Pub/Sub retries it. The check adds roughly 30–40% to generation cost.
 - **Answers stay server-side:** questions are returned without `a`/`e`; the grade endpoint scores answers and then reveals them.
 
 ## LLM providers
@@ -57,13 +59,13 @@ pnpm admin account suspend --account acct_…
 
 ### Endpoints
 
-| Method | Path                                                             | Scope   | Result                                                                                                    |
-| ------ | ---------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
-| `POST` | `/v1/assessments` `{ "topic", "locale"?: "en", "ttlSeconds"? }`  | `write` | `200 { status: "ready", match, assessment }` or `202 { jobId, status }` with `Location` and `Retry-After` |
-| `GET`  | `/v1/jobs/{jobId}`                                               | `read`  | `{ jobId, status, assessmentId, error }`                                                                  |
-| `GET`  | `/v1/assessments/{id}`                                           | `read`  | `{ id, topic, locale, createdAt, expiresAt, questions: [{ i, q, o, d }] }`                                |
-| `POST` | `/v1/assessments/{id}/grade` `{ "answers": [0-3 or null, ...] }` | `grade` | `{ score, total, results: [{ i, correct, a, e }] }`                                                       |
-| `GET`  | `/v1/usage`                                                      | `read`  | Requests this month and generations today against the plan, plus rate limits                              |
+| Method | Path                                                                                   | Scope   | Result                                                                                                    |
+| ------ | -------------------------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `POST` | `/v1/assessments` `{ "topic", "locale"?: "en", "ttlSeconds"?, "questionsPerLevel"? }`  | `write` | `200 { status: "ready", match, assessment }` or `202 { jobId, status }` with `Location` and `Retry-After` |
+| `GET`  | `/v1/jobs/{jobId}`                                                                     | `read`  | `{ jobId, status, assessmentId, error }`                                                                  |
+| `GET`  | `/v1/assessments/{id}?questionsPerLevel=`                                              | `read`  | `{ id, topic, locale, questionsPerLevel, createdAt, expiresAt, questions: [{ i, q, o, d }] }`             |
+| `POST` | `/v1/assessments/{id}/grade` `{ "questionsPerLevel"?, "answers": [0-3 or null, ...] }` | `grade` | `{ score, total, results: [{ i, correct, a, e }] }`                                                       |
+| `GET`  | `/v1/usage`                                                                            | `read`  | Requests this month and generations today against the plan, plus rate limits                              |
 
 Question keys: `q` question, `o` four options, `a` correct option index, `e` explanation, `d` difficulty (1 easy, 2 medium, 3 hard). Job `error` is `topic_rejected`, `generation_capacity_exhausted` or `generation_failed`.
 

@@ -60,6 +60,8 @@ curl -s "$SYNAPSET_URL/v1/assessments/<assessmentId>/grade" \
 
 - **Cached first.** An assessment is generated once, then served to every caller until it expires. Requesting the same topic again returns `"match": "exact"`. A paraphrase such as "ownership in Rust" for "Rust ownership" returns the existing assessment with `"match": "semantic"`.
 - **Generated on a miss.** A topic nobody has requested yet is queued for generation, and you get `202 Accepted` with a job to poll. Generating a topic counts against your plan's daily generation quota. Cache hits don't.
+- **Choose how many questions.** Each topic is generated once at the service maximum (10 per level by default). Pass `questionsPerLevel` to receive fewer. Every count is served from the same cached assessment, so a smaller count never triggers a new generation.
+- **Answers are checked before publishing.** After generating, a second model pass answers every question without seeing the key. Questions it answers differently, or finds ambiguous or opinion-based, are discarded and replaced by spares.
 - **Answers stay private until grading.** `GET /v1/assessments/{id}` returns questions and options only. The correct answers and explanations come back from the grade endpoint.
 - **Expiry.** Each assessment has an `expiresAt` (30 days by default). After that it is regenerated in full on the next request.
 
@@ -91,11 +93,12 @@ Authorization: Bearer synapset_sk_<keyId>_<secret>
 
 `POST /v1/assessments` · scope `assessments:write`
 
-| Field        | Type    | Required | Rules                                                                                                                                        |
-| ------------ | ------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `topic`      | string  | yes      | 2–120 characters after trimming. Casing, extra spaces and Unicode variants are normalised.                                                   |
-| `locale`     | string  | no       | Language of the questions, such as `en`, `es` or `pt-BR`. Default `en`.                                                                      |
-| `ttlSeconds` | integer | no       | How long a newly generated assessment stays cached. Minimum 3600, capped by the service (365 days). Default 30 days. Ignored on a cache hit. |
+| Field               | Type    | Required | Rules                                                                                                                                                                                               |
+| ------------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `topic`             | string  | yes      | 2–120 characters after trimming. Casing, extra spaces and Unicode variants are normalised.                                                                                                          |
+| `locale`            | string  | no       | Language of the questions, such as `en`, `es` or `pt-BR`. Default `en`.                                                                                                                             |
+| `ttlSeconds`        | integer | no       | How long a newly generated assessment stays cached. Minimum 3600, capped by the service (365 days). Default 30 days. Ignored on a cache hit.                                                        |
+| `questionsPerLevel` | integer | no       | Questions per difficulty level in the response, from 1 to the service maximum (`assessments.maxQuestionsPerLevel` in [usage](#get-your-usage)). Default: the maximum. A larger value returns `400`. |
 
 Unknown fields are rejected with `400`.
 
@@ -146,15 +149,17 @@ Returns a [job](#job). While the status is `pending` or `running`, the response 
 
 Returns an [assessment](#assessment), without answers. Returns `404 not_found` if the ID is unknown or the assessment has expired. To get a fresh one, `POST` the topic again.
 
+Add `?questionsPerLevel=N` for a smaller selection. A given `N` always returns the same questions in the same order: the first `N` of each difficulty level.
+
 ### Grade answers
 
 `POST /v1/assessments/{id}/grade` · scope `assessments:grade`
 
 ```json
-{ "answers": [0, 2, null, 1] }
+{ "questionsPerLevel": 5, "answers": [0, 2, null, 1, ...] }
 ```
 
-`answers` must have exactly one entry per question, in question order (`i`). Each entry is the chosen option index (0–3), or `null` for unanswered. A wrong length returns `400 invalid_request`.
+Send the same `questionsPerLevel` you fetched the assessment with (omit it if you didn't pass one). `answers` must have exactly one entry per question of that selection, in question order (`i`). Each entry is the chosen option index (0–3), or `null` for unanswered. A wrong length returns `400 invalid_request`.
 
 ```json
 {
@@ -183,7 +188,8 @@ Grading stores nothing. You can grade the same assessment as many times as neede
   "plan": "free",
   "requests": { "used": 128, "limit": 10000, "resetsAt": "2026-11-01T00:00:00.000Z" },
   "generations": { "used": 3, "limit": 20, "resetsAt": "2026-10-28T00:00:00.000Z" },
-  "rateLimit": { "requestsPerMinute": 30, "burst": 10, "maxConcurrent": 2 }
+  "rateLimit": { "requestsPerMinute": 30, "burst": 10, "maxConcurrent": 2 },
+  "assessments": { "maxQuestionsPerLevel": 10 }
 }
 ```
 
@@ -199,14 +205,15 @@ Grading stores nothing. You can grade the same assessment as many times as neede
 
 ### Assessment
 
-| Field       | Type     | Description                                |
-| ----------- | -------- | ------------------------------------------ |
-| `id`        | string   | 64-character hex ID                        |
-| `topic`     | string   | Topic the assessment was generated for     |
-| `locale`    | string   | Language of the questions                  |
-| `createdAt` | ISO 8601 | Generation time                            |
-| `expiresAt` | ISO 8601 | After this, the assessment is regenerated  |
-| `questions` | array    | Questions, ordered from easiest to hardest |
+| Field               | Type     | Description                                     |
+| ------------------- | -------- | ----------------------------------------------- |
+| `id`                | string   | 64-character hex ID                             |
+| `topic`             | string   | Topic the assessment was generated for          |
+| `locale`            | string   | Language of the questions                       |
+| `questionsPerLevel` | integer  | Questions per difficulty level in this response |
+| `createdAt`         | ISO 8601 | Generation time                                 |
+| `expiresAt`         | ISO 8601 | After this, the assessment is regenerated       |
+| `questions`         | array    | Questions, ordered from easiest to hardest      |
 
 ### Question
 
@@ -219,7 +226,7 @@ Keys are short because assessments are large.
 | `o` | string[4] | Options. Their order is randomised, so position carries no signal |
 | `d` | integer   | Difficulty: `1` easy, `2` medium, `3` hard                        |
 
-A default assessment has 10 questions per difficulty level, 30 in total.
+By default an assessment has 10 questions per difficulty level, 30 in total; `questionsPerLevel` selects fewer.
 
 ### Grade result
 

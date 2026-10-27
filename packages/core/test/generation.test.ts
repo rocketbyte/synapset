@@ -27,13 +27,13 @@ const message: GenerateMessage = {
   promptVersion: PROMPT_VERSION,
   ttlSeconds: 3600,
 };
-const success = (): Promise<GenerationResult> =>
-  Promise.resolve({
-    questions: questions(1),
-    provider: 'anthropic',
-    model: 'claude-haiku-5-5',
-    usage: { inputTokens: 500, outputTokens: 900 },
-  });
+const successResult = (): GenerationResult => ({
+  questions: questions(1),
+  provider: 'anthropic',
+  model: 'claude-haiku-5-5',
+  usage: { inputTokens: 500, outputTokens: 900 },
+});
+const success = () => Promise.resolve(successResult());
 
 describe('GenerationService', () => {
   let repo: InMemoryRepository;
@@ -48,7 +48,7 @@ describe('GenerationService', () => {
       llm,
       new SpendGuard(store, 1, () => NOW),
       usage,
-      { leaseSeconds: 300, maxDeliveryAttempts: 5 },
+      { leaseSeconds: 300, maxDeliveryAttempts: 5, verifyAnswers: true },
       silentLogger,
       () => NOW,
     );
@@ -68,7 +68,7 @@ describe('GenerationService', () => {
 
     const stored = repo.assessments.get(JOB_ID);
     expect(stored?.expiresAt.getTime()).toBe(NOW.getTime() + 3_600_000);
-    expect(stored?.usage.outputTokens).toBe(900);
+    expect(stored?.usage.outputTokens).toBe(900 + 100); // generation + answer check
     expect(repo.embeddings.get(JOB_ID)).toHaveLength(768);
     expect(repo.jobs.get(JOB_ID)).toMatchObject({ status: 'done', assessmentId: JOB_ID });
   });
@@ -76,9 +76,10 @@ describe('GenerationService', () => {
   it('records the cost against the daily budget and meters it to the triggering account', async () => {
     await service(new FakeLlm(success)).handle(message, 1);
 
-    // 500 input x $0.10/M + 900 output x $0.50/M
-    const cost = 0.0005;
-    expect(await store.get(counterKeys.dailySpend(NOW))).toBe(toMicroUsd(cost));
+    // Generation: 500 input x $0.10/M + 900 output x $0.50/M. Check: 100 x $0.10/M + 100 x $0.50/M.
+    const generation = 0.0005;
+    const check = 0.00006;
+    expect(await store.get(counterKeys.dailySpend(NOW))).toBe(toMicroUsd(generation) + toMicroUsd(check));
     expect(usage.events).toEqual([
       expect.objectContaining({
         event: 'llm.generation',
@@ -86,9 +87,36 @@ describe('GenerationService', () => {
         job_id: JOB_ID,
         input_tokens: 500,
         output_tokens: 900,
-        cost_usd: cost,
+        cost_usd: generation,
       }),
+      expect.objectContaining({ event: 'llm.generation', input_tokens: 100, output_tokens: 100 }),
     ]);
+  });
+
+  it('generates spares and keeps only questions whose answer key the checker confirms', async () => {
+    const llm = new FakeLlm(
+      () => Promise.resolve({ ...successResult(), questions: questions(2) }),
+      (question) => question.q === 'Level 2 question 0?',
+    );
+
+    await expect(service(llm).handle(message, 1)).resolves.toBe('generated');
+
+    expect(llm.generatedPerLevel).toEqual([2]);
+    expect(llm.verifyCalls).toBe(1);
+    const stored = repo.assessments.get(JOB_ID);
+    expect(stored?.questions.map((q) => q.q)).toEqual([
+      'Level 1 question 0?',
+      'Level 2 question 1?',
+      'Level 3 question 0?',
+    ]);
+    expect(stored?.usage).toEqual({ inputTokens: 600, outputTokens: 1000 });
+  });
+
+  it('retries when too few questions survive the check', async () => {
+    const llm = new FakeLlm(success, (question) => question.d === 3);
+
+    await expect(service(llm).handle(message, 1)).rejects.toThrow(/Expected 1 valid questions per level/);
+    expect(repo.jobs.get(JOB_ID)?.status).toBe('pending');
   });
 
   it('fails queued jobs without calling the LLM once the budget is spent', async () => {

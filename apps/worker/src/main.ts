@@ -34,7 +34,11 @@ const service = new GenerationService(
   createLlmProvider(config, logger),
   new SpendGuard(limits.store, config.LLM_DAILY_BUDGET_USD),
   usage,
-  { leaseSeconds: config.JOB_LEASE_SECONDS, maxDeliveryAttempts: config.MAX_DELIVERY_ATTEMPTS },
+  {
+    leaseSeconds: config.JOB_LEASE_SECONDS,
+    maxDeliveryAttempts: config.MAX_DELIVERY_ATTEMPTS,
+    verifyAnswers: config.VERIFY_ANSWERS,
+  },
   logger,
 );
 

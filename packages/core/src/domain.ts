@@ -68,20 +68,24 @@ function shuffleOptions(question: Question): Question {
   };
 }
 
+/** Drops malformed and duplicate questions. */
+export function usableQuestions(raw: readonly Question[]): Question[] {
+  const seen = new Set<string>();
+  return raw.filter((question) => {
+    const key = question.q.trim().toLowerCase();
+    if (!isWellFormed(question) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /**
  * Drops malformed and duplicate questions, then requires exactly `perLevel` per difficulty.
- * Throws InvalidOutputError (retryable) when the model produced too few usable questions.
+ * Throws InvalidOutputError (retryable) when too few usable questions remain.
  */
 export function finalizeQuestions(raw: readonly Question[], perLevel: number): Question[] {
-  const seen = new Set<string>();
   const byLevel = new Map<number, Question[]>(LEVELS.map((level) => [level, []]));
-
-  for (const question of raw) {
-    const key = question.q.trim().toLowerCase();
-    if (!isWellFormed(question) || seen.has(key)) continue;
-    seen.add(key);
-    byLevel.get(question.d)?.push(question);
-  }
+  for (const question of usableQuestions(raw)) byLevel.get(question.d)?.push(question);
 
   const shortfalls = LEVELS.filter((level) => (byLevel.get(level)?.length ?? 0) < perLevel);
   if (shortfalls.length > 0) {
@@ -90,4 +94,12 @@ export function finalizeQuestions(raw: readonly Question[], perLevel: number): Q
   }
 
   return LEVELS.flatMap((level) => (byLevel.get(level) ?? []).slice(0, perLevel).map(shuffleOptions));
+}
+
+/** The first `perLevel` questions of each difficulty: every caller sees the same subset for a given count. */
+export function selectQuestions<T extends Pick<Question, 'd'>>(
+  questions: readonly T[],
+  perLevel: number,
+): T[] {
+  return LEVELS.flatMap((level) => questions.filter((question) => question.d === level).slice(0, perLevel));
 }

@@ -18,12 +18,20 @@ import {
   InMemoryIdentityRepository,
   InMemoryRepository,
   assessment,
+  questions,
 } from '../../../packages/core/test/fakes.js';
 import { buildServer } from '../src/server.js';
 
 const ALL_SCOPES: Scope[] = ['assessments:read', 'assessments:write', 'assessments:grade'];
 
-async function setup(options: { scopes?: Scope[]; limits?: Partial<PlanLimits>; budgetUsd?: number } = {}) {
+async function setup(
+  options: {
+    scopes?: Scope[];
+    limits?: Partial<PlanLimits>;
+    budgetUsd?: number;
+    questionsPerLevel?: number;
+  } = {},
+) {
   const repo = new InMemoryRepository();
   const identities = new InMemoryIdentityRepository();
   const limits = new MemoryLimitStore();
@@ -55,7 +63,7 @@ async function setup(options: { scopes?: Scope[]; limits?: Partial<PlanLimits>; 
     new FakeQueue(),
     new SpendGuard(limits, options.budgetUsd ?? 10),
     {
-      questionsPerLevel: 1,
+      questionsPerLevel: options.questionsPerLevel ?? 1,
       similarityThreshold: 0.88,
       defaultTtlSeconds: 3600,
       maxTtlSeconds: 7200,
@@ -262,6 +270,56 @@ describe('assessments', () => {
       payload: { answers: target.questions.map((q) => q.a) },
     });
     expect(graded.json()).toMatchObject({ score: 3, total: 3 });
+  });
+
+  it('serves any question count up to the generated size from the same assessment', async () => {
+    const { app, repo, auth } = await setup({ questionsPerLevel: 3 });
+    const target = assessment({ questions: questions(3), expiresAt: new Date(Date.now() + 60_000) });
+    repo.assessments.set(target.id, target);
+    const url = `/v1/assessments/${target.id}`;
+
+    const full = await app.inject({ method: 'GET', url, headers: auth });
+    expect(full.json()).toMatchObject({ questionsPerLevel: 3 });
+    expect(full.json<{ questions: object[] }>().questions).toHaveLength(9);
+
+    const small = await app.inject({ method: 'GET', url: `${url}?questionsPerLevel=2`, headers: auth });
+    const view = small.json<{
+      questionsPerLevel: number;
+      questions: { i: number; q: string; d: number }[];
+    }>();
+    expect(view.questionsPerLevel).toBe(2);
+    expect(view.questions.map((q) => [q.i, q.d])).toEqual([
+      [0, 1],
+      [1, 1],
+      [2, 2],
+      [3, 2],
+      [4, 3],
+      [5, 3],
+    ]);
+
+    const selected = view.questions.map(({ q }) => target.questions.find((t) => t.q === q)?.a ?? null);
+    const graded = await app.inject({
+      method: 'POST',
+      url: `${url}/grade`,
+      headers: auth,
+      payload: { questionsPerLevel: 2, answers: selected },
+    });
+    expect(graded.json()).toMatchObject({ score: 6, total: 6 });
+
+    const tooMany = await app.inject({ method: 'GET', url: `${url}?questionsPerLevel=4`, headers: auth });
+    expect(tooMany.statusCode).toBe(400);
+    expect(tooMany.json()).toMatchObject({ detail: 'questionsPerLevel must be at most 3' });
+
+    const miscounted = await app.inject({
+      method: 'POST',
+      url: `${url}/grade`,
+      headers: auth,
+      payload: { answers: selected },
+    });
+    expect(miscounted.statusCode).toBe(400);
+
+    const usage = await app.inject({ method: 'GET', url: '/v1/usage', headers: auth });
+    expect(usage.json()).toMatchObject({ assessments: { maxQuestionsPerLevel: 3 } });
   });
 
   it('sets security headers and returns problems for unknown routes', async () => {

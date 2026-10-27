@@ -1,4 +1,11 @@
-import { cacheKey, isFresh, normalizeTopic, scopeKey, type GenerationScope } from '../domain.js';
+import {
+  cacheKey,
+  isFresh,
+  normalizeTopic,
+  scopeKey,
+  selectQuestions,
+  type GenerationScope,
+} from '../domain.js';
 import type { Principal } from '../auth.js';
 import { PROMPT_VERSION } from '../prompt.js';
 import type { Assessment, Job } from '../schemas.js';
@@ -14,6 +21,7 @@ import type {
 const NEAREST_CANDIDATES = 5;
 
 export interface AssessmentServiceOptions {
+  /** Every assessment is generated with this many questions per level; callers may request fewer. */
   questionsPerLevel: number;
   similarityThreshold: number;
   defaultTtlSeconds: number;
@@ -128,9 +136,21 @@ export class AssessmentService {
     return this.repo.getJob(id);
   }
 
-  /** `answers[i]` is the chosen option index for question i, or null when unanswered. */
-  grade(assessment: Assessment, answers: readonly (number | null)[]): GradeResult {
-    const results = assessment.questions.map((question, i) => ({
+  get maxQuestionsPerLevel(): number {
+    return this.options.questionsPerLevel;
+  }
+
+  /** The questions a caller sees when asking for `perLevel` per difficulty, in the order they are graded. */
+  questionsFor(assessment: Assessment, perLevel: number) {
+    return selectQuestions(assessment.questions, perLevel);
+  }
+
+  /**
+   * `answers[i]` is the chosen option index for question i of the `perLevel` selection, or null when
+   * unanswered.
+   */
+  grade(assessment: Assessment, perLevel: number, answers: readonly (number | null)[]): GradeResult {
+    const results = this.questionsFor(assessment, perLevel).map((question, i) => ({
       i,
       correct: answers[i] === question.a,
       a: question.a,

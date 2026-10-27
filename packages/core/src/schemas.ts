@@ -22,6 +22,20 @@ export const GenerationOutputSchema = z.object({
 });
 export type GenerationOutput = z.infer<typeof GenerationOutputSchema>;
 
+/** Structured-output contract for the blind answer check. */
+export const VerificationOutputSchema = z.object({
+  rs: z.array(
+    z.object({
+      i: z.number().int().describe('Index of the question'),
+      a: z.number().int().describe('0-based index of the correct option, or -1 if none is correct'),
+      ok: z
+        .boolean()
+        .describe('true only if exactly one option is unambiguously correct and the question is clear'),
+    }),
+  ),
+});
+export type VerificationOutput = z.infer<typeof VerificationOutputSchema>;
+
 export const LocaleSchema = z
   .string()
   .regex(/^[a-z]{2,3}(-[A-Z]{2})?$/, 'Expected a language tag such as "en" or "pt-BR"');

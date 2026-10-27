@@ -24,7 +24,13 @@ const ConfigSchema = z.object({
   EMBEDDING_MODEL: z.string().default('gemini-embedding-2'),
 
   SIMILARITY_THRESHOLD: z.coerce.number().gt(0).lt(1).default(0.88),
+  /** Questions generated per difficulty level; callers may request fewer, never more. */
   QUESTIONS_PER_LEVEL: z.coerce.number().int().min(1).max(20).default(10),
+  /** Blind-answer every generated question and drop those whose key the model disputes. */
+  VERIFY_ANSWERS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
   ASSESSMENT_TTL_SECONDS: z.coerce
     .number()
     .int()

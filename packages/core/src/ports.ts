@@ -1,18 +1,36 @@
 import type { Account, ApiKeyRecord, Principal } from './auth.js';
 import type { LlmProviderName } from './config.js';
-import type { PromptInput } from './prompt.js';
+import type { PromptInput, VerifyInput } from './prompt.js';
 import type { Assessment, GenerateMessage, Job, Question, TokenUsage } from './schemas.js';
 
-export interface GenerationResult {
-  questions: Question[];
+export interface LlmCall {
   provider: LlmProviderName;
   model: string;
   usage: TokenUsage;
 }
 
+export interface GenerationResult extends LlmCall {
+  /** As returned by the model: not yet checked for shape, duplicates or counts. */
+  questions: Question[];
+}
+
+export interface Verdict {
+  /** Index into the verified questions. */
+  i: number;
+  /** The option the checker chose, or -1 if it found none correct. */
+  a: number;
+  ok: boolean;
+}
+
+export interface VerificationResult extends LlmCall {
+  verdicts: Verdict[];
+}
+
 export interface LlmProvider {
   readonly name: LlmProviderName;
   generate(input: PromptInput): Promise<GenerationResult>;
+  /** Answers the questions without the key, so the caller can drop those it disagrees with. */
+  verify(input: VerifyInput): Promise<VerificationResult>;
 }
 
 export interface Embedder {

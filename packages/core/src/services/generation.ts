@@ -1,15 +1,37 @@
 import { randomUUID } from 'node:crypto';
 import type { Logger } from 'pino';
-import { isFresh, normalizeTopic, scopeKey } from '../domain.js';
+import { finalizeQuestions, isFresh, normalizeTopic, scopeKey, usableQuestions } from '../domain.js';
 import { PermanentError, TransientError } from '../errors.js';
 import { PROMPT_VERSION } from '../prompt.js';
-import type { GenerateMessage } from '../schemas.js';
-import type { AssessmentRepository, Clock, Embedder, LlmProvider, UsageRecorder } from '../ports.js';
+import type { GenerateMessage, Question } from '../schemas.js';
+import type {
+  AssessmentRepository,
+  Clock,
+  Embedder,
+  LlmCall,
+  LlmProvider,
+  UsageRecorder,
+  Verdict,
+} from '../ports.js';
 import type { SpendGuard } from './spend.js';
 
 export interface GenerationServiceOptions {
   leaseSeconds: number;
   maxDeliveryAttempts: number;
+  /** Have the model answer every question blind and drop those whose key it disputes. */
+  verifyAnswers: boolean;
+}
+
+/** Extra questions per level, so the answer check can drop some without failing the generation. */
+export const spareQuestions = (perLevel: number) => Math.ceil(perLevel / 4);
+
+/** Keeps the questions the checker answered the same way and judged unambiguous. */
+export function keepVerified(questions: readonly Question[], verdicts: readonly Verdict[]): Question[] {
+  const byIndex = new Map(verdicts.map((verdict) => [verdict.i, verdict]));
+  return questions.filter((question, i) => {
+    const verdict = byIndex.get(i);
+    return verdict?.ok === true && verdict.a === question.a;
+  });
 }
 
 /** Every outcome acknowledges the message; retryable failures throw instead. */
@@ -53,13 +75,33 @@ export class GenerationService {
       const embedding = message.embedding ?? (await this.embedder.embed(topicNormalized));
       // Checked here as well as at admission: jobs queued before the budget ran out must not spend past it.
       await this.spend.assertBudgetAvailable();
+      const perLevel = message.questionsPerLevel;
+      const { verifyAnswers } = this.options;
       const result = await this.llm.generate({
         topic: message.topic,
         locale: message.locale,
-        questionsPerLevel: message.questionsPerLevel,
+        questionsPerLevel: perLevel + (verifyAnswers ? spareQuestions(perLevel) : 0),
       });
+      let costUsd = await this.recordCost(message, result, log);
+      let usage = result.usage;
 
-      const costUsd = await this.recordCost(message, result, log);
+      let candidates = usableQuestions(result.questions);
+      if (verifyAnswers) {
+        const verification = await this.llm.verify({ locale: message.locale, questions: candidates });
+        costUsd += await this.recordCost(message, verification, log);
+        usage = {
+          inputTokens: usage.inputTokens + verification.usage.inputTokens,
+          outputTokens: usage.outputTokens + verification.usage.outputTokens,
+        };
+        const verified = keepVerified(candidates, verification.verdicts);
+        log.info(
+          { candidates: candidates.length, rejected: candidates.length - verified.length },
+          'Answers checked',
+        );
+        candidates = verified;
+      }
+      // Too few left is retryable: Pub/Sub redelivers and the next attempt generates afresh.
+      const questions = finalizeQuestions(candidates, perLevel);
 
       const now = this.clock();
       await this.repo.saveAssessment(
@@ -74,22 +116,19 @@ export class GenerationService {
             promptVersion: message.promptVersion,
             embeddingModel: this.embedder.model,
           }),
-          questions: result.questions,
+          questions,
           llmProvider: result.provider,
           model: result.model,
           promptVersion: message.promptVersion,
           embeddingModel: this.embedder.model,
-          usage: result.usage,
+          usage,
           createdAt: now,
           expiresAt: new Date(now.getTime() + message.ttlSeconds * 1000),
         },
         embedding,
       );
       await this.repo.completeJob(message.jobId, message.jobId, now);
-      log.info(
-        { provider: result.provider, model: result.model, usage: result.usage, costUsd },
-        'Assessment generated',
-      );
+      log.info({ provider: result.provider, model: result.model, usage, costUsd }, 'Assessment generated');
       return 'generated';
     } catch (error) {
       const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
@@ -105,12 +144,11 @@ export class GenerationService {
     }
   }
 
-  /** Spend is recorded as soon as tokens are paid for, even if persisting the assessment then fails. */
-  private async recordCost(
-    message: GenerateMessage,
-    result: Awaited<ReturnType<LlmProvider['generate']>>,
-    log: Logger,
-  ): Promise<number | null> {
+  /**
+   * Spend is recorded as soon as tokens are paid for, even if persisting the assessment then fails.
+   * Returns 0 when the spend could not be recorded.
+   */
+  private async recordCost(message: GenerateMessage, result: LlmCall, log: Logger): Promise<number> {
     let costUsd: number | null = null;
     try {
       costUsd = await this.spend.recordSpend(result.model, result.usage);
@@ -129,6 +167,6 @@ export class GenerationService {
       output_tokens: result.usage.outputTokens,
       cost_usd: costUsd ?? 0,
     });
-    return costUsd;
+    return costUsd ?? 0;
   }
 }

@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 import { ProviderUnavailableError } from '../../errors.js';
-import type { PromptInput } from '../../prompt.js';
-import type { Clock, GenerationResult, LlmProvider } from '../../ports.js';
+import type { PromptInput, VerifyInput } from '../../prompt.js';
+import type { Clock, GenerationResult, LlmProvider, VerificationResult } from '../../ports.js';
 
 const COOLDOWN_MS = 5 * 60_000;
 
@@ -23,10 +23,18 @@ export class FailoverLlmProvider implements LlmProvider {
     return this.primary.name;
   }
 
-  async generate(input: PromptInput): Promise<GenerationResult> {
-    if (this.clock().getTime() < this.primaryDownUntil) return this.fallback.generate(input);
+  generate(input: PromptInput): Promise<GenerationResult> {
+    return this.route((provider) => provider.generate(input));
+  }
+
+  verify(input: VerifyInput): Promise<VerificationResult> {
+    return this.route((provider) => provider.verify(input));
+  }
+
+  private async route<T>(call: (provider: LlmProvider) => Promise<T>): Promise<T> {
+    if (this.clock().getTime() < this.primaryDownUntil) return call(this.fallback);
     try {
-      return await this.primary.generate(input);
+      return await call(this.primary);
     } catch (error) {
       if (!(error instanceof ProviderUnavailableError)) throw error;
       this.primaryDownUntil = this.clock().getTime() + COOLDOWN_MS;
@@ -34,7 +42,7 @@ export class FailoverLlmProvider implements LlmProvider {
         { err: error, primary: this.primary.name, fallback: this.fallback.name },
         'LLM provider unavailable; failing over',
       );
-      return this.fallback.generate(input);
+      return call(this.fallback);
     }
   }
 }

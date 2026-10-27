@@ -14,7 +14,7 @@ import {
   type Assessment,
   type GenerationScope,
 } from '@synapset/core';
-import { FakeEmbedder, FakeQueue, InMemoryRepository, assessment, principal } from './fakes.js';
+import { FakeEmbedder, FakeQueue, InMemoryRepository, assessment, principal, questions } from './fakes.js';
 
 const NOW = new Date('2026-10-26T12:00:00Z');
 const SCOPE: GenerationScope = {
@@ -199,10 +199,38 @@ describe('AssessmentService.grade', () => {
     const target = assessment();
     const answers = target.questions.map((q, i) => (i === 0 ? q.a : null));
 
-    const result = service.grade(target, answers);
+    const result = service.grade(target, 1, answers);
 
     expect(result.score).toBe(1);
     expect(result.total).toBe(3);
     expect(result.results[1]).toMatchObject({ correct: false, a: target.questions[1]?.a });
+  });
+
+  it('serves and grades a smaller selection of the same assessment', () => {
+    const service = new AssessmentService(
+      new InMemoryRepository(),
+      new FakeEmbedder(),
+      new FakeQueue(),
+      new SpendGuard(new MemoryLimitStore(), 1),
+      {
+        questionsPerLevel: 3,
+        similarityThreshold: 0.88,
+        defaultTtlSeconds: 1,
+        maxTtlSeconds: 1,
+        jobStaleSeconds: 1,
+      },
+    );
+    const target = assessment({ questions: questions(3) });
+
+    const selected = service.questionsFor(target, 2);
+    expect(selected.map((q) => q.d)).toEqual([1, 1, 2, 2, 3, 3]);
+    expect(selected[2]).toBe(target.questions[3]);
+
+    const result = service.grade(
+      target,
+      2,
+      selected.map((q) => q.a),
+    );
+    expect(result).toMatchObject({ score: 6, total: 6 });
   });
 });

@@ -11,7 +11,12 @@ import { questions, silentLogger } from './fakes.js';
 const input = { topic: 'x', locale: 'en', questionsPerLevel: 1 };
 
 function provider(name: 'anthropic' | 'gemini', behaviour: () => Promise<GenerationResult>) {
-  const p = { name, calls: 0, generate: () => (p.calls++, behaviour()) };
+  const p = {
+    name,
+    calls: 0,
+    generate: () => (p.calls++, behaviour()),
+    verify: () => Promise.reject(new Error('not used')),
+  };
   return p satisfies LlmProvider;
 }
 const ok = (name: 'anthropic' | 'gemini') => () =>
