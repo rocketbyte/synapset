@@ -18,12 +18,14 @@ Client ─▶ api (Cloud Run, public)
          worker (Cloud Run, internal) → lease job → LLM → validate → store assessment + vector
 ```
 
-- **Cache key:** sha256 of the normalized topic plus its scope (locale, questions per level, prompt version, embedding model). Changing any of these produces new assessments; changing the LLM does not.
+- **Cache key:** sha256 of the normalized topic and context plus its scope (locale, questions per level, prompt version, embedding model). Changing any of these produces new assessments; changing the LLM does not.
 - **Semantic match:** cosine similarity ≥ `SIMILARITY_THRESHOLD` (0.88) within the same scope. A match is saved as an alias, so the next identical request is an exact hit.
 - **Expiry:** `expiresAt` is checked on every read; an expired assessment is regenerated in full. Firestore TTL deletes old documents later (typically within 24 hours).
 - **Deduplication:** concurrent misses share one job; the worker's lease and idempotent writes make Pub/Sub redeliveries harmless.
+- **Question bank:** every checked question is stored on its own (Firestore `questions`) with an embedding of its text and correct answer. On a miss, the API embeds topic + context once and searches the bank for each difficulty level. A question is reused if its similarity exceeds the request's noise floor (its similarity to a fixed set of unrelated questions) by `QUESTION_REUSE_MARGIN` (0.08). Near-duplicates are collapsed. If every level is covered, the assessment is composed with no LLM call and no generation charged. Otherwise the worker generates only the missing questions, tells the model which ones exist, and drops any new one that duplicates them. Calibrated on gemini-embedding-2: at 0.08, 96% of reused questions were relevant and 59% of relevant ones were found; reuse fails open (search errors fall back to generation). `REUSE_QUESTIONS=false` disables it.
+- **Context:** optional caller guidance (focus, audience, emphasis; up to 1000 characters). It is part of the cache key and the embedded request text, and it is passed to the generator inside `<context>` tags as guidance that can't override the rules.
 - **Question count:** every topic is generated once with `QUESTIONS_PER_LEVEL` questions per level (default 10, max 20). Callers pass `questionsPerLevel` to receive the first N per level of the same cached assessment, so the count never multiplies generations.
-- **Answer check:** with `VERIFY_ANSWERS=true` (default), the worker generates about 25% spare questions, has the model answer each one blind, and keeps only those whose key it confirms and judges unambiguous. Too few survivors fails the attempt, and Pub/Sub retries it. The check adds roughly 30–40% to generation cost.
+- **Answer check:** with `VERIFY_ANSWERS=true` (default), the worker generates about 25% spare questions, has the model answer each one blind, and keeps only those whose key it confirms and judges unambiguous. Questions that pass are kept, and a second round asks only for what's still missing; still short after that fails the attempt, and Pub/Sub retries it. The check adds roughly 30–40% to generation cost.
 - **Answers stay server-side:** questions are returned without `a`/`e`; the grade endpoint scores answers and then reveals them.
 
 ## LLM providers
@@ -59,13 +61,13 @@ pnpm admin account suspend --account acct_…
 
 ### Endpoints
 
-| Method | Path                                                                                   | Scope   | Result                                                                                                    |
-| ------ | -------------------------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
-| `POST` | `/v1/assessments` `{ "topic", "locale"?: "en", "ttlSeconds"?, "questionsPerLevel"? }`  | `write` | `200 { status: "ready", match, assessment }` or `202 { jobId, status }` with `Location` and `Retry-After` |
-| `GET`  | `/v1/jobs/{jobId}`                                                                     | `read`  | `{ jobId, status, assessmentId, error }`                                                                  |
-| `GET`  | `/v1/assessments/{id}?questionsPerLevel=`                                              | `read`  | `{ id, topic, locale, questionsPerLevel, createdAt, expiresAt, questions: [{ i, q, o, d }] }`             |
-| `POST` | `/v1/assessments/{id}/grade` `{ "questionsPerLevel"?, "answers": [0-3 or null, ...] }` | `grade` | `{ score, total, results: [{ i, correct, a, e }] }`                                                       |
-| `GET`  | `/v1/usage`                                                                            | `read`  | Requests this month and generations today against the plan, plus rate limits                              |
+| Method | Path                                                                                              | Scope   | Result                                                                                        |
+| ------ | ------------------------------------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `POST` | `/v1/assessments` `{ "topic", "context"?, "locale"?: "en", "ttlSeconds"?, "questionsPerLevel"? }` | `write` | `200 { status: "ready", match: exact                                                          | semantic | composed, assessment }`or`202 { jobId, status }`with`Location`and`Retry-After` |
+| `GET`  | `/v1/jobs/{jobId}`                                                                                | `read`  | `{ jobId, status, assessmentId, error }`                                                      |
+| `GET`  | `/v1/assessments/{id}?questionsPerLevel=`                                                         | `read`  | `{ id, topic, locale, questionsPerLevel, createdAt, expiresAt, questions: [{ i, q, o, d }] }` |
+| `POST` | `/v1/assessments/{id}/grade` `{ "questionsPerLevel"?, "answers": [0-3 or null, ...] }`            | `grade` | `{ score, total, results: [{ i, correct, a, e }] }`                                           |
+| `GET`  | `/v1/usage`                                                                                       | `read`  | Requests this month and generations today against the plan, plus rate limits                  |
 
 Question keys: `q` question, `o` four options, `a` correct option index, `e` explanation, `d` difficulty (1 easy, 2 medium, 3 hard). Job `error` is `topic_rejected`, `generation_capacity_exhausted` or `generation_failed`.
 

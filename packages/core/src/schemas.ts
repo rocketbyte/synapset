@@ -4,6 +4,8 @@ import { EMBEDDING_DIMENSIONS } from './config.js';
 export const LEVELS = [1, 2, 3] as const;
 export const OPTIONS_PER_QUESTION = 4;
 export const MAX_TOPIC_LENGTH = 120;
+/** Bounds the prompt tokens a caller's guidance can add. */
+export const MAX_CONTEXT_LENGTH = 1000;
 
 /** Minified keys keep LLM output tokens and storage small. */
 export const QuestionSchema = z.object({
@@ -46,11 +48,14 @@ export const GenerateMessageSchema = z.object({
   /** Account that triggered (and pays for) the generation. */
   accountId: z.string().min(1),
   topic: z.string().min(1).max(MAX_TOPIC_LENGTH),
+  context: z.string().max(MAX_CONTEXT_LENGTH).optional(),
   locale: LocaleSchema,
   questionsPerLevel: z.number().int().positive(),
   promptVersion: z.string(),
   ttlSeconds: z.number().int().positive(),
   embedding: z.array(z.number()).length(EMBEDDING_DIMENSIONS).optional(),
+  /** Bank questions the API selected for reuse; the worker generates only what they leave missing. */
+  reuse: z.array(z.string()).optional(),
 });
 export type GenerateMessage = z.infer<typeof GenerateMessageSchema>;
 
@@ -63,6 +68,8 @@ export interface Assessment {
   id: string;
   topic: string;
   topicNormalized: string;
+  /** Caller guidance the questions were generated or selected for. */
+  context: string | null;
   locale: string;
   /** Hash of everything that changes generated content; vector search is pre-filtered on it. */
   scope: string;
@@ -72,6 +79,20 @@ export interface Assessment {
   promptVersion: string;
   embeddingModel: string;
   usage: TokenUsage;
+  /** Questions taken from the bank rather than generated for this assessment. */
+  reusedQuestions: number;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+/** A checked question stored on its own, so other assessments can reuse it without an LLM call. */
+export interface BankQuestion extends Question {
+  id: string;
+  /** Hash of what makes questions interchangeable: locale, prompt version, embedding model. */
+  scope: string;
+  /** Embedding of the question and its correct option. */
+  embedding: number[];
+  sourceAssessmentId: string;
   createdAt: Date;
   expiresAt: Date;
 }

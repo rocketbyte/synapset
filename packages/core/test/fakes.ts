@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   EMBEDDING_DIMENSIONS,
   LEVELS,
@@ -7,6 +8,9 @@ import {
   type Account,
   type ApiKeyRecord,
   type Assessment,
+  type BankQuestion,
+  type PromptInput,
+  type QuestionMatch,
   type IdentityRepository,
   type PlanLimits,
   type Principal,
@@ -44,6 +48,7 @@ export function assessment(overrides: Partial<Assessment> = {}): Assessment {
     id: 'a'.repeat(64),
     topic: 'TypeScript generics',
     topicNormalized: 'typescript generics',
+    context: null,
     locale: 'en',
     scope: 'scope',
     questions: questions(1),
@@ -52,18 +57,42 @@ export function assessment(overrides: Partial<Assessment> = {}): Assessment {
     promptVersion: 'v',
     embeddingModel: 'fake-embedding',
     usage: { inputTokens: 1, outputTokens: 1 },
+    reusedQuestions: 0,
     createdAt: new Date('2026-10-01T00:00:00Z'),
     expiresAt: new Date('2026-11-01T00:00:00Z'),
     ...overrides,
   };
 }
 
+/** A unit vector along `axis`, or a mix of axes: cosine between two such vectors is their dot product. */
+export function axisVector(weights: Record<number, number>): number[] {
+  const values = Array.from({ length: EMBEDDING_DIMENSIONS }, (_, i) => weights[i] ?? 0);
+  const norm = Math.hypot(...values);
+  return values.map((v) => v / norm);
+}
+
+/**
+ * Unrelated texts get near-orthogonal vectors (seeded by the text), as real embeddings of unrelated
+ * text do. Tests pin specific texts to chosen vectors with `vectors`.
+ */
 export class FakeEmbedder implements Embedder {
   readonly model = 'fake-embedding';
   calls = 0;
-  embed(): Promise<number[]> {
+  texts: string[] = [];
+  vectors = new Map<string, number[]>();
+
+  embed(text: string): Promise<number[]> {
     this.calls++;
-    return Promise.resolve(Array.from({ length: EMBEDDING_DIMENSIONS }, (_, i) => (i === 0 ? 1 : 0)));
+    this.texts.push(text);
+    const pinned = this.vectors.get(text);
+    if (pinned) return Promise.resolve(pinned);
+    let seed = createHash('sha256').update(text).digest().readUInt32BE(0);
+    const values = Array.from({ length: EMBEDDING_DIMENSIONS }, () => {
+      seed = (Math.imul(seed, 1_103_515_245) + 12_345) >>> 0;
+      return seed / 2 ** 32 - 0.5;
+    });
+    const norm = Math.hypot(...values);
+    return Promise.resolve(values.map((v) => v / norm));
   }
 }
 
@@ -85,7 +114,7 @@ export class FakeLlm implements LlmProvider {
   readonly name = 'anthropic';
   calls = 0;
   verifyCalls = 0;
-  generatedPerLevel: number[] = [];
+  requests: PromptInput[] = [];
   private generated: Question[] = [];
 
   constructor(
@@ -93,9 +122,9 @@ export class FakeLlm implements LlmProvider {
     private readonly dispute: (question: Question) => boolean = () => false,
   ) {}
 
-  async generate(input: { questionsPerLevel: number }): Promise<GenerationResult> {
+  async generate(input: PromptInput): Promise<GenerationResult> {
     this.calls++;
-    this.generatedPerLevel.push(input.questionsPerLevel);
+    this.requests.push(input);
     const result = await this.behaviour();
     this.generated = result.questions;
     return result;
@@ -122,6 +151,7 @@ export class InMemoryRepository implements AssessmentRepository {
   aliases = new Map<string, string>();
   jobs = new Map<string, Job>();
   nearest: NearestMatch[] = [];
+  bank = new Map<string, BankQuestion>();
 
   getAssessment(id: string) {
     return Promise.resolve(this.assessments.get(id) ?? null);
@@ -130,6 +160,30 @@ export class InMemoryRepository implements AssessmentRepository {
     return Promise.resolve(
       this.nearest.filter((m) => m.assessment.scope === scope && m.distance <= maxDistance),
     );
+  }
+  findNearestQuestions(
+    embedding: number[],
+    scope: string,
+    level: number,
+    maxDistance: number,
+    limit: number,
+  ) {
+    const matches: QuestionMatch[] = [...this.bank.values()]
+      .filter((q) => q.scope === scope && q.d === level)
+      .map((question) => ({
+        question,
+        distance: 1 - question.embedding.reduce((sum, v, i) => sum + v * (embedding[i] ?? 0), 0),
+      }))
+      .filter((m) => m.distance <= maxDistance)
+      .sort((a, b) => a.distance - b.distance);
+    return Promise.resolve(matches.slice(0, limit));
+  }
+  getQuestions(ids: readonly string[]) {
+    return Promise.resolve(ids.flatMap((id) => this.bank.get(id) ?? []));
+  }
+  saveQuestions(questions: readonly BankQuestion[]) {
+    for (const question of questions) this.bank.set(question.id, question);
+    return Promise.resolve();
   }
   getAlias(key: string) {
     return Promise.resolve(this.aliases.get(key) ?? null);
@@ -242,4 +296,27 @@ export class InMemoryIdentityRepository implements IdentityRepository {
     this.accounts.set(account.id, account);
     return Promise.resolve();
   }
+}
+
+/** A bank question whose embedding is `embedding`; its text is unique per (level, label). */
+export function bankQuestion(
+  scope: string,
+  d: number,
+  label: string,
+  embedding: number[],
+  expiresAt = new Date('2027-01-01T00:00:00Z'),
+): BankQuestion {
+  return {
+    id: `${scope}-${d}-${label}`,
+    q: `Bank ${label} at level ${d}?`,
+    o: ['alpha', 'beta', 'gamma', 'delta'],
+    a: 1,
+    e: 'Because.',
+    d,
+    scope,
+    embedding,
+    sourceAssessmentId: 'src',
+    createdAt: new Date('2026-10-01T00:00:00Z'),
+    expiresAt,
+  };
 }

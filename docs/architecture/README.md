@@ -6,13 +6,13 @@ PNG diagrams rendered at 2x. When the architecture changes, update them in the s
 
 ![System overview](system-overview.png)
 
-Two Cloud Run services share one Firestore database. The public API answers from cache whenever it can. The internal worker is the only component that calls an LLM, and it is reached only through Pub/Sub. Orange marks the one paid path, the LLM call. Gemini serves for 5 minutes at a time whenever Anthropic reports billing, authentication or permission errors. Both services publish usage events, and BigQuery stores them for billing.
+Two Cloud Run services share one Firestore database. The public API answers from cache whenever it can. The internal worker is the only component that calls an LLM, and it is reached only through Pub/Sub. Orange marks the one paid path, the LLM call. Gemini serves for 5 minutes at a time whenever Anthropic reports billing, authentication or permission errors. Both services publish usage events, and BigQuery stores them for billing. Every checked question is also stored on its own in the `questions` bank, so later assessments can reuse it.
 
 ## Resolving a topic
 
 ![Resolving a topic](resolve-topic.png)
 
-The API tries the cheapest source first. Only a full miss charges the caller a generation against its plan and the global daily budget. Both are refunded if the job can't be enqueued. Vector search is pre-filtered on a scope hash: locale, questions per level, prompt version and embedding model. Changing any of these therefore never serves a stale format. Code: `packages/core/src/services/assessments.ts`.
+The API tries the cheapest source first. The request is identified by its topic and context. After the cached-assessment lookups, it searches the question bank by meaning for each difficulty level. A question qualifies if its similarity clearly exceeds the request's noise floor (its similarity to unrelated questions). If the bank covers every level, the assessment is composed on the spot, with no LLM call and no charge. Otherwise the caller is charged one generation against its plan and the global daily budget, and the job carries the reused question IDs, so the worker generates only the gap. The charge is refunded if the job can't be enqueued. Searches are pre-filtered on a scope hash (locale, prompt version and embedding model, plus questions per level for whole assessments), so changing any of these never serves a stale format. Code: `packages/core/src/services/assessments.ts`, `packages/core/src/services/question-bank.ts`.
 
 ## Generation jobs
 

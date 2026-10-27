@@ -59,6 +59,8 @@ curl -s "$SYNAPSET_URL/v1/assessments/<assessmentId>/grade" \
 ![Resolving a topic](architecture/resolve-topic.png)
 
 - **Cached first.** An assessment is generated once, then served to every caller until it expires. Requesting the same topic again returns `"match": "exact"`. A paraphrase such as "ownership in Rust" for "Rust ownership" returns the existing assessment with `"match": "semantic"`.
+- **Questions are shared across topics.** Every checked question is kept in a question bank. A new request is matched against it by meaning, so "Finance, focusing on taxes" can reuse tax questions written for "Income tax basics". If the bank covers every difficulty level, the assessment is assembled immediately (`"match": "composed"`), with no generation and no generation quota used. Otherwise only the missing questions are generated, and the model is told which questions already exist so it doesn't repeat them.
+- **Context steers the assessment.** The optional `context` tells the generator what to focus on, who the audience is, or what to emphasise or avoid. It is also used to pick relevant questions from the bank. Different context is a different assessment.
 - **Generated on a miss.** A topic nobody has requested yet is queued for generation, and you get `202 Accepted` with a job to poll. Generating a topic counts against your plan's daily generation quota. Cache hits don't.
 - **Choose how many questions.** Each topic is generated once at the service maximum (10 per level by default). Pass `questionsPerLevel` to receive fewer. Every count is served from the same cached assessment, so a smaller count never triggers a new generation.
 - **Answers are checked before publishing.** After generating, a second model pass answers every question without seeing the key. Questions it answers differently, or finds ambiguous or opinion-based, are discarded and replaced by spares.
@@ -93,12 +95,13 @@ Authorization: Bearer synapset_sk_<keyId>_<secret>
 
 `POST /v1/assessments` · scope `assessments:write`
 
-| Field               | Type    | Required | Rules                                                                                                                                                                                               |
-| ------------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `topic`             | string  | yes      | 2–120 characters after trimming. Casing, extra spaces and Unicode variants are normalised.                                                                                                          |
-| `locale`            | string  | no       | Language of the questions, such as `en`, `es` or `pt-BR`. Default `en`.                                                                                                                             |
-| `ttlSeconds`        | integer | no       | How long a newly generated assessment stays cached. Minimum 3600, capped by the service (365 days). Default 30 days. Ignored on a cache hit.                                                        |
-| `questionsPerLevel` | integer | no       | Questions per difficulty level in the response, from 1 to the service maximum (`assessments.maxQuestionsPerLevel` in [usage](#get-your-usage)). Default: the maximum. A larger value returns `400`. |
+| Field               | Type    | Required | Rules                                                                                                                                                                                                                                     |
+| ------------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `topic`             | string  | yes      | 2–120 characters after trimming. Casing, extra spaces and Unicode variants are normalised.                                                                                                                                                |
+| `locale`            | string  | no       | Language of the questions, such as `en`, `es` or `pt-BR`. Default `en`.                                                                                                                                                                   |
+| `context`           | string  | no       | Guidance, up to 1000 characters: focus areas, audience, what to emphasise or avoid. Example: `"Focus on taxes: deductions, credits and how income tax is calculated."` Treated as guidance only; it can't change the format or the rules. |
+| `ttlSeconds`        | integer | no       | How long a newly generated assessment stays cached. Minimum 3600, capped by the service (365 days). Default 30 days. Ignored on a cache hit.                                                                                              |
+| `questionsPerLevel` | integer | no       | Questions per difficulty level in the response, from 1 to the service maximum (`assessments.maxQuestionsPerLevel` in [usage](#get-your-usage)). Default: the maximum. A larger value returns `400`.                                       |
 
 Unknown fields are rejected with `400`.
 
@@ -111,6 +114,7 @@ Unknown fields are rejected with `400`.
   "assessment": {
     "id": "dc003d4d7d13f29316646bbc1a17699849b6648c006a6c013bb17bcafc4c05ac",
     "topic": "Rust ownership",
+    "context": null,
     "locale": "en",
     "createdAt": "2026-10-27T00:56:55.594Z",
     "expiresAt": "2026-11-26T00:56:55.594Z",
@@ -131,7 +135,11 @@ Unknown fields are rejected with `400`.
 }
 ```
 
-With `"match": "semantic"`, `assessment.topic` is the topic the assessment was originally generated for, which may be worded differently from yours.
+| `match`    | Meaning                                                                                                              |
+| ---------- | -------------------------------------------------------------------------------------------------------------------- |
+| `exact`    | This topic and context were requested before                                                                         |
+| `semantic` | An equivalent assessment exists. `assessment.topic` is the one it was generated for, which may be worded differently |
+| `composed` | Assembled now from existing questions on the subject. No generation was needed, and none was charged                 |
 
 **`202 Accepted`: generation queued.** The response carries a `Location: /v1/jobs/{jobId}` header and a `Retry-After` header, with a [job](#job) as the body. Concurrent requests for the same topic share one job and are charged once.
 

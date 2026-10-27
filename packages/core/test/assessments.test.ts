@@ -4,7 +4,10 @@ import {
   BudgetExhaustedError,
   MemoryLimitStore,
   PROMPT_VERSION,
+  QuestionBank,
   QuotaExceededError,
+  bankScopeKey,
+  requestText,
   SpendGuard,
   counterKeys,
   toMicroUsd,
@@ -14,7 +17,17 @@ import {
   type Assessment,
   type GenerationScope,
 } from '@synapset/core';
-import { FakeEmbedder, FakeQueue, InMemoryRepository, assessment, principal, questions } from './fakes.js';
+import {
+  FakeEmbedder,
+  FakeQueue,
+  InMemoryRepository,
+  assessment,
+  axisVector,
+  bankQuestion,
+  principal,
+  questions,
+  silentLogger,
+} from './fakes.js';
 
 const NOW = new Date('2026-10-26T12:00:00Z');
 const SCOPE: GenerationScope = {
@@ -52,8 +65,7 @@ describe('AssessmentService.resolve', () => {
         maxTtlSeconds: 7200,
         jobStaleSeconds: 900,
       },
-      cache,
-      () => NOW,
+      { cache, clock: () => NOW },
     );
   });
 
@@ -178,6 +190,89 @@ describe('AssessmentService.resolve', () => {
     expect(error).toBeInstanceOf(BudgetExhaustedError);
     expect((error as BudgetExhaustedError).retryAt.toISOString()).toBe('2026-10-27T00:00:00.000Z');
     expect(queue.published).toHaveLength(0);
+  });
+});
+
+describe('AssessmentService.resolve with the question bank', () => {
+  const BANK = bankScopeKey({
+    locale: 'en',
+    promptVersion: PROMPT_VERSION,
+    embeddingModel: 'fake-embedding',
+  });
+  const caller = principal({ generationsPerDay: 2 });
+
+  function setup() {
+    const repo = new InMemoryRepository();
+    const embedder = new FakeEmbedder();
+    const queue = new FakeQueue();
+    const store = new MemoryLimitStore(() => NOW);
+    const service = new AssessmentService(
+      repo,
+      embedder,
+      queue,
+      new SpendGuard(store, 5, () => NOW),
+      {
+        questionsPerLevel: 2,
+        similarityThreshold: 0.88,
+        defaultTtlSeconds: 3600,
+        maxTtlSeconds: 7200,
+        jobStaleSeconds: 900,
+      },
+      {
+        bank: new QuestionBank(repo, embedder, { margin: 0.08 }, silentLogger, () => NOW),
+        clock: () => NOW,
+      },
+    );
+    const request = { topic: 'Finance', context: '  Focus on   taxes ', locale: 'en' };
+    const text = requestText('finance', 'Focus on taxes');
+    embedder.vectors.set(text, axisVector({ 0: 1 }));
+    const relevant = (d: number, label: string, axis: number) =>
+      bankQuestion(BANK, d, label, axisVector({ 0: 0.9, [axis]: 0.44 }));
+    return { repo, embedder, queue, store, service, request, text, relevant };
+  }
+
+  it('composes an assessment from the bank when it covers every level, without generating', async () => {
+    const { repo, embedder, queue, store, service, request, text, relevant } = setup();
+    await repo.saveQuestions([1, 2, 3].flatMap((d) => [relevant(d, 'x', 10 + d), relevant(d, 'y', 20 + d)]));
+
+    const result = await service.resolve(request, caller);
+
+    expect(result).toMatchObject({ status: 'ready', match: 'composed' });
+    if (result.status !== 'ready') throw new Error('unreachable');
+    expect(result.assessment).toMatchObject({ context: 'Focus on taxes', reusedQuestions: 6, model: 'bank' });
+    expect(result.assessment.questions.map((q) => q.d)).toEqual([1, 1, 2, 2, 3, 3]);
+    expect(embedder.texts[0]).toBe(text);
+    expect(queue.published).toHaveLength(0);
+    expect(await store.get(counterKeys.dailyGenerations(caller.accountId, NOW))).toBe(0);
+
+    // The composed assessment is cached under the request: the next identical request is an exact hit.
+    await expect(service.resolve(request, caller)).resolves.toMatchObject({ match: 'exact' });
+  });
+
+  it('queues generation of only what the bank lacks, passing the reused ids and the context', async () => {
+    const { repo, queue, store, service, request, relevant } = setup();
+    await repo.saveQuestions([relevant(1, 'x', 11), relevant(1, 'y', 12), relevant(3, 'x', 13)]);
+
+    const result = await service.resolve(request, caller);
+
+    expect(result).toMatchObject({ status: 'pending' });
+    expect(queue.published[0]).toMatchObject({
+      context: 'Focus on taxes',
+      reuse: [`${BANK}-1-x`, `${BANK}-1-y`, `${BANK}-3-x`],
+    });
+    expect(await store.get(counterKeys.dailyGenerations(caller.accountId, NOW))).toBe(1);
+  });
+
+  it('treats different context as a different assessment', async () => {
+    const { repo, service, request } = setup();
+    const scope = { ...SCOPE, questionsPerLevel: 2 };
+    const key = cacheKey(requestText('finance', 'Focus on taxes'), scope);
+    repo.assessments.set(key, assessment({ id: key, expiresAt: new Date('2027-01-01T00:00:00Z') }));
+
+    await expect(service.resolve(request, caller)).resolves.toMatchObject({ match: 'exact' });
+    await expect(
+      service.resolve({ ...request, context: 'Focus on investing' }, caller),
+    ).resolves.toMatchObject({ status: 'pending' });
   });
 });
 

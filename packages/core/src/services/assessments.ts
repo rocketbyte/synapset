@@ -1,14 +1,18 @@
 import {
+  bankScopeKey,
   cacheKey,
+  cleanContext,
   isFresh,
   normalizeTopic,
+  requestText,
   scopeKey,
   selectQuestions,
+  uniformCounts,
   type GenerationScope,
 } from '../domain.js';
 import type { Principal } from '../auth.js';
 import { PROMPT_VERSION } from '../prompt.js';
-import type { Assessment, Job } from '../schemas.js';
+import type { Assessment, BankQuestion, Job } from '../schemas.js';
 import type {
   AssessmentCache,
   AssessmentRepository,
@@ -17,6 +21,7 @@ import type {
   GenerationGate,
   JobQueue,
 } from '../ports.js';
+import type { QuestionBank } from './question-bank.js';
 
 const NEAREST_CANDIDATES = 5;
 
@@ -31,12 +36,23 @@ export interface AssessmentServiceOptions {
 
 export interface ResolveInput {
   topic: string;
+  /** Guidance on focus, audience or emphasis; part of what identifies the assessment. */
+  context?: string | undefined;
   locale: string;
   ttlSeconds?: number | undefined;
 }
 
+export type ResolveMatch = 'exact' | 'semantic' | 'composed';
+
 export type ResolveResult =
-  { status: 'ready'; assessment: Assessment; match: 'exact' | 'semantic' } | { status: 'pending'; job: Job };
+  { status: 'ready'; assessment: Assessment; match: ResolveMatch } | { status: 'pending'; job: Job };
+
+export interface AssessmentServiceDependencies {
+  cache?: AssessmentCache | undefined;
+  /** Without a bank every miss is generated in full. */
+  bank?: QuestionBank | undefined;
+  clock?: Clock | undefined;
+}
 
 export interface GradeResult {
   score: number;
@@ -51,29 +67,39 @@ export class AssessmentService {
     private readonly queue: JobQueue,
     private readonly gate: GenerationGate,
     private readonly options: AssessmentServiceOptions,
-    private readonly cache?: AssessmentCache,
-    private readonly clock: Clock = () => new Date(),
-  ) {}
+    dependencies: AssessmentServiceDependencies = {},
+  ) {
+    this.cache = dependencies.cache;
+    this.bank = dependencies.bank;
+    this.clock = dependencies.clock ?? (() => new Date());
+  }
+
+  private readonly cache: AssessmentCache | undefined;
+  private readonly bank: QuestionBank | undefined;
+  private readonly clock: Clock;
 
   /**
-   * Cheapest source first: memory, exact key, alias, vector search. Only a full miss enqueues generation,
-   * and only the caller who claims the job is charged a generation against its plan and the LLM budget.
+   * Cheapest source first: memory, exact key, alias, similar assessment, then questions reused from the
+   * bank. Only what the bank cannot cover is generated, and only the caller who claims that job is
+   * charged a generation against its plan and the LLM budget.
    */
   async resolve(input: ResolveInput, requester: Principal): Promise<ResolveResult> {
     const now = this.clock();
     const topicNormalized = normalizeTopic(input.topic);
+    const context = cleanContext(input.context);
+    const text = requestText(topicNormalized, context);
     const scope: GenerationScope = {
       locale: input.locale,
       questionsPerLevel: this.options.questionsPerLevel,
       promptVersion: PROMPT_VERSION,
       embeddingModel: this.embedder.model,
     };
-    const key = cacheKey(topicNormalized, scope);
+    const key = cacheKey(text, scope);
 
     const exact = await this.findExact(key, now);
     if (exact) return { status: 'ready', assessment: exact, match: 'exact' };
 
-    const embedding = await this.embedder.embed(topicNormalized);
+    const embedding = await this.embedder.embed(text);
     const nearest = (
       await this.repo.findNearest(
         embedding,
@@ -86,6 +112,35 @@ export class AssessmentService {
       await this.repo.saveAlias(key, nearest.assessment.id, nearest.assessment.expiresAt);
       this.cache?.set(key, nearest.assessment);
       return { status: 'ready', assessment: nearest.assessment, match: 'semantic' };
+    }
+
+    const perLevel = this.options.questionsPerLevel;
+    const reuse = this.bank
+      ? await this.bank.select(
+          embedding,
+          bankScopeKey({
+            locale: input.locale,
+            promptVersion: PROMPT_VERSION,
+            embeddingModel: this.embedder.model,
+          }),
+          uniformCounts(perLevel),
+        )
+      : [];
+    const ttlSeconds = Math.min(
+      input.ttlSeconds ?? this.options.defaultTtlSeconds,
+      this.options.maxTtlSeconds,
+    );
+    if (reuse.length > 0 && reuse.every((level) => level.length === perLevel)) {
+      const assessment = composeAssessment(key, input.topic.trim(), topicNormalized, context, input.locale, {
+        scope: scopeKey(scope),
+        embeddingModel: this.embedder.model,
+        questions: reuse.flat(),
+        now,
+        ttlSeconds,
+      });
+      await this.repo.saveAssessment(assessment, embedding);
+      this.cache?.set(key, assessment);
+      return { status: 'ready', assessment, match: 'composed' };
     }
 
     const { job, claimed } = await this.repo.claimJob(
@@ -108,14 +163,13 @@ export class AssessmentService {
           jobId: key,
           accountId: requester.accountId,
           topic: job.topic,
+          ...(context ? { context } : {}),
           locale: input.locale,
           questionsPerLevel: scope.questionsPerLevel,
           promptVersion: PROMPT_VERSION,
-          ttlSeconds: Math.min(
-            input.ttlSeconds ?? this.options.defaultTtlSeconds,
-            this.options.maxTtlSeconds,
-          ),
+          ttlSeconds,
           embedding,
+          reuse: reuse.flat().map((question) => question.id),
         });
       } catch (error) {
         // Unblock the next request instead of leaving a pending job that no message will ever process.
@@ -172,4 +226,32 @@ export class AssessmentService {
     this.cache?.set(key, assessment);
     return assessment;
   }
+}
+
+/** An assessment built entirely from bank questions: no LLM call, no generation charged. */
+function composeAssessment(
+  id: string,
+  topic: string,
+  topicNormalized: string,
+  context: string | null,
+  locale: string,
+  parts: { scope: string; embeddingModel: string; questions: BankQuestion[]; now: Date; ttlSeconds: number },
+): Assessment {
+  return {
+    id,
+    topic,
+    topicNormalized,
+    context,
+    locale,
+    scope: parts.scope,
+    questions: parts.questions.map(({ q, o, a, e, d }) => ({ q, o, a, e, d })),
+    llmProvider: 'bank',
+    model: 'bank',
+    promptVersion: PROMPT_VERSION,
+    embeddingModel: parts.embeddingModel,
+    usage: { inputTokens: 0, outputTokens: 0 },
+    reusedQuestions: parts.questions.length,
+    createdAt: parts.now,
+    expiresAt: new Date(parts.now.getTime() + parts.ttlSeconds * 1000),
+  };
 }

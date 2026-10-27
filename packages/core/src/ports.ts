@@ -1,7 +1,7 @@
 import type { Account, ApiKeyRecord, Principal } from './auth.js';
 import type { LlmProviderName } from './config.js';
 import type { PromptInput, VerifyInput } from './prompt.js';
-import type { Assessment, GenerateMessage, Job, Question, TokenUsage } from './schemas.js';
+import type { Assessment, BankQuestion, GenerateMessage, Job, Question, TokenUsage } from './schemas.js';
 
 export interface LlmCall {
   provider: LlmProviderName;
@@ -45,6 +45,12 @@ export interface NearestMatch {
   distance: number;
 }
 
+export interface QuestionMatch {
+  question: BankQuestion;
+  /** Cosine distance: 0 is identical. */
+  distance: number;
+}
+
 export interface NewJob {
   id: string;
   topic: string;
@@ -65,6 +71,18 @@ export interface AssessmentRepository {
   getAlias(key: string): Promise<string | null>;
   saveAlias(key: string, assessmentId: string, expiresAt: Date): Promise<void>;
   saveAssessment(assessment: Assessment, embedding: number[]): Promise<void>;
+
+  /** Nearest bank questions of one difficulty within the scope and `maxDistance`, closest first. */
+  findNearestQuestions(
+    embedding: number[],
+    scope: string,
+    level: number,
+    maxDistance: number,
+    limit: number,
+  ): Promise<QuestionMatch[]>;
+  /** Missing ids are skipped: bank questions expire on their own. */
+  getQuestions(ids: readonly string[]): Promise<BankQuestion[]>;
+  saveQuestions(questions: readonly BankQuestion[]): Promise<void>;
 
   getJob(id: string): Promise<Job | null>;
   /** Creates or resets the job unless one is already in flight. `claimed` means the caller must publish. */
@@ -157,7 +175,7 @@ export type UsageEvent =
       route: string;
       status: number;
       latency_ms: number;
-      match: 'exact' | 'semantic' | null;
+      match: 'exact' | 'semantic' | 'composed' | null;
       generation_queued: boolean;
     })
   | (UsageEventBase & {

@@ -217,6 +217,20 @@ describe('assessments', () => {
     expect(response.json()).toMatchObject({ status: 'pending' });
   });
 
+  it('accepts context, keeps it in the assessment identity and bounds its length', async () => {
+    const { app, auth } = await setup();
+    const post = (payload: object) =>
+      app.inject({ method: 'POST', url: '/v1/assessments', headers: auth, payload });
+
+    const plain = await post({ topic: 'Finance' });
+    const focused = await post({ topic: 'Finance', context: 'Focus on taxes and deductions' });
+    expect(focused.statusCode).toBe(202);
+    expect(focused.json<{ jobId: string }>().jobId).not.toBe(plain.json<{ jobId: string }>().jobId);
+
+    const tooLong = await post({ topic: 'Finance', context: 'x'.repeat(1001) });
+    expect(tooLong.statusCode).toBe(400);
+  });
+
   it('rejects invalid and unexpected input', async () => {
     const { app, auth } = await setup();
     const invalid = await app.inject({

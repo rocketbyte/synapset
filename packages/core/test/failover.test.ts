@@ -8,7 +8,7 @@ import {
 } from '@synapset/core';
 import { questions, silentLogger } from './fakes.js';
 
-const input = { topic: 'x', locale: 'en', questionsPerLevel: 1 };
+const input = { topic: 'x', locale: 'en', counts: { 1: 1, 2: 1, 3: 1 } };
 
 function provider(name: 'anthropic' | 'gemini', behaviour: () => Promise<GenerationResult>) {
   const p = {

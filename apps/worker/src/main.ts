@@ -3,6 +3,7 @@ import {
   GenerationService,
   LogUsageRecorder,
   PubSubUsageRecorder,
+  QuestionBank,
   SpendGuard,
   VertexEmbedder,
   createFirestore,
@@ -25,13 +26,16 @@ const usage =
     ? new PubSubUsageRecorder(pubsub, config.USAGE_TOPIC, logger)
     : new LogUsageRecorder(logger);
 
+const repository = new FirestoreAssessmentRepository(firestore);
+const embedder = new VertexEmbedder(
+  createGenAiClient(config.GCP_PROJECT_ID, config.VERTEX_LOCATION),
+  config.EMBEDDING_MODEL,
+);
 const service = new GenerationService(
-  new FirestoreAssessmentRepository(firestore),
-  new VertexEmbedder(
-    createGenAiClient(config.GCP_PROJECT_ID, config.VERTEX_LOCATION),
-    config.EMBEDDING_MODEL,
-  ),
+  repository,
+  embedder,
   createLlmProvider(config, logger),
+  new QuestionBank(repository, embedder, { margin: config.QUESTION_REUSE_MARGIN }, logger),
   new SpendGuard(limits.store, config.LLM_DAILY_BUDGET_USD),
   usage,
   {

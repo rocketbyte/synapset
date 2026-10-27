@@ -5,13 +5,16 @@ import {
   type DocumentData,
   type DocumentSnapshot,
   type Firestore,
+  type VectorValue,
 } from '@google-cloud/firestore';
-import type { Assessment, Job } from '../schemas.js';
-import type { AssessmentRepository, LeaseResult, NearestMatch, NewJob } from '../ports.js';
+import type { Assessment, BankQuestion, Job } from '../schemas.js';
+import type { AssessmentRepository, LeaseResult, NearestMatch, NewJob, QuestionMatch } from '../ports.js';
 
 const DISTANCE_FIELD = '_distance';
 /** Jobs are bookkeeping only; TTL removes them after this long. */
 const JOB_RETENTION_MS = 7 * 86_400_000;
+/** Firestore's limit on writes in one batch. */
+const BATCH_LIMIT = 500;
 
 const toDate = (value: unknown): Date => (value as Timestamp).toDate();
 const toDateOrNull = (value: unknown): Date | null => (value ? toDate(value) : null);
@@ -22,6 +25,7 @@ function toAssessment(snapshot: DocumentSnapshot): Assessment {
     id: snapshot.id,
     topic: d.topic as string,
     topicNormalized: d.topicNormalized as string,
+    context: (d.context as string | null | undefined) ?? null,
     locale: d.locale as string,
     scope: d.scope as string,
     questions: d.questions as Assessment['questions'],
@@ -30,6 +34,24 @@ function toAssessment(snapshot: DocumentSnapshot): Assessment {
     promptVersion: d.promptVersion as string,
     embeddingModel: d.embeddingModel as string,
     usage: d.usage as Assessment['usage'],
+    reusedQuestions: (d.reusedQuestions as number | undefined) ?? 0,
+    createdAt: toDate(d.createdAt),
+    expiresAt: toDate(d.expiresAt),
+  };
+}
+
+function toBankQuestion(snapshot: DocumentSnapshot): BankQuestion {
+  const d = snapshot.data() as DocumentData;
+  return {
+    id: snapshot.id,
+    q: d.q as string,
+    o: d.o as string[],
+    a: d.a as number,
+    e: d.e as string,
+    d: d.d as number,
+    scope: d.scope as string,
+    embedding: (d.embedding as VectorValue).toArray(),
+    sourceAssessmentId: d.sourceAssessmentId as string,
     createdAt: toDate(d.createdAt),
     expiresAt: toDate(d.expiresAt),
   };
@@ -56,8 +78,10 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
   private readonly assessments: CollectionReference;
   private readonly aliases: CollectionReference;
   private readonly jobs: CollectionReference;
+  private readonly questions: CollectionReference;
 
   constructor(private readonly db: Firestore) {
+    this.questions = db.collection('questions');
     this.assessments = db.collection('assessments');
     this.aliases = db.collection('topic_keys');
     this.jobs = db.collection('jobs');
@@ -108,6 +132,55 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
       createdAt: Timestamp.fromDate(createdAt),
       expiresAt: Timestamp.fromDate(expiresAt),
     });
+  }
+
+  async findNearestQuestions(
+    embedding: number[],
+    scope: string,
+    level: number,
+    maxDistance: number,
+    limit: number,
+  ): Promise<QuestionMatch[]> {
+    const result = await this.questions
+      .where('scope', '==', scope)
+      .where('d', '==', level)
+      .findNearest({
+        vectorField: 'embedding',
+        queryVector: embedding,
+        limit,
+        distanceMeasure: 'COSINE',
+        distanceThreshold: maxDistance,
+        distanceResultField: DISTANCE_FIELD,
+      })
+      .get();
+    return result.docs.map((doc) => ({
+      question: toBankQuestion(doc),
+      distance: doc.get(DISTANCE_FIELD) as number,
+    }));
+  }
+
+  async getQuestions(ids: readonly string[]): Promise<BankQuestion[]> {
+    if (ids.length === 0) return [];
+    const snapshots = await this.db.getAll(...ids.map((id) => this.questions.doc(id)));
+    return snapshots.filter((snapshot) => snapshot.exists).map(toBankQuestion);
+  }
+
+  async saveQuestions(questions: readonly BankQuestion[]): Promise<void> {
+    for (let start = 0; start < questions.length; start += BATCH_LIMIT) {
+      const batch = this.db.batch();
+      for (const { id, embedding, createdAt, expiresAt, ...fields } of questions.slice(
+        start,
+        start + BATCH_LIMIT,
+      )) {
+        batch.set(this.questions.doc(id), {
+          ...fields,
+          embedding: FieldValue.vector(embedding),
+          createdAt: Timestamp.fromDate(createdAt),
+          expiresAt: Timestamp.fromDate(expiresAt),
+        });
+      }
+      await batch.commit();
+    }
   }
 
   async getJob(id: string): Promise<Job | null> {

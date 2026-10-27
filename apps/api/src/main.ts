@@ -7,6 +7,7 @@ import {
   LogUsageRecorder,
   PubSubJobQueue,
   PubSubUsageRecorder,
+  QuestionBank,
   SpendGuard,
   VertexEmbedder,
   createFirestore,
@@ -29,12 +30,17 @@ const usage =
     ? new PubSubUsageRecorder(pubsub, config.USAGE_TOPIC, logger)
     : new LogUsageRecorder(logger);
 
+const repository = new FirestoreAssessmentRepository(firestore);
+const embedder = new VertexEmbedder(
+  createGenAiClient(config.GCP_PROJECT_ID, config.VERTEX_LOCATION),
+  config.EMBEDDING_MODEL,
+);
+const bank = config.REUSE_QUESTIONS
+  ? new QuestionBank(repository, embedder, { margin: config.QUESTION_REUSE_MARGIN }, logger)
+  : undefined;
 const service = new AssessmentService(
-  new FirestoreAssessmentRepository(firestore),
-  new VertexEmbedder(
-    createGenAiClient(config.GCP_PROJECT_ID, config.VERTEX_LOCATION),
-    config.EMBEDDING_MODEL,
-  ),
+  repository,
+  embedder,
   new PubSubJobQueue(pubsub.topic(config.PUBSUB_TOPIC)),
   new SpendGuard(limits.store, config.LLM_DAILY_BUDGET_USD),
   {
@@ -44,7 +50,10 @@ const service = new AssessmentService(
     maxTtlSeconds: config.ASSESSMENT_MAX_TTL_SECONDS,
     jobStaleSeconds: config.JOB_STALE_SECONDS,
   },
-  new LRUCache<string, Assessment>({ max: 5_000, ttl: 60_000 }),
+  {
+    cache: new LRUCache<string, Assessment>({ max: 5_000, ttl: 60_000 }),
+    bank,
+  },
 );
 
 const app = await buildServer({
@@ -72,4 +81,6 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   });
 }
 
+// Runs during startup, while the instance still has full CPU; never fails startup.
+void bank?.warmUp();
 await app.listen({ host: '0.0.0.0', port: config.PORT });

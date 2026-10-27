@@ -34,10 +34,39 @@ resource "google_firestore_index" "assessments_vector" {
   }
 }
 
+# Question bank: where('scope', '==', s).where('d', '==', level).findNearest('embedding', ...).
+resource "google_firestore_index" "questions_vector" {
+  database   = google_firestore_database.main.name
+  collection = "questions"
+
+  fields {
+    field_path = "scope"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "d"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "__name__"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "embedding"
+    vector_config {
+      dimension = 768
+      flat {}
+    }
+  }
+}
+
 # TTL deletes expired documents (typically within 24h); the services check expiresAt themselves.
 # Timestamp fields are exempt from indexing to avoid write hotspots.
 resource "google_firestore_field" "expires_at" {
-  for_each   = toset(["assessments", "topic_keys", "jobs", "limits"])
+  for_each   = toset(["assessments", "topic_keys", "jobs", "limits", "questions"])
   database   = google_firestore_database.main.name
   collection = each.value
   field      = "expiresAt"
@@ -46,11 +75,17 @@ resource "google_firestore_field" "expires_at" {
   index_config {}
 }
 
-# The question array is never queried; indexing it would multiply write cost.
-resource "google_firestore_field" "questions_unindexed" {
+# Fields that are only read, never queried; indexing them would multiply write cost.
+resource "google_firestore_field" "unindexed" {
+  for_each = {
+    "assessments/questions" = ["assessments", "questions"]
+    "questions/q"           = ["questions", "q"]
+    "questions/o"           = ["questions", "o"]
+    "questions/e"           = ["questions", "e"]
+  }
   database   = google_firestore_database.main.name
-  collection = "assessments"
-  field      = "questions"
+  collection = each.value[0]
+  field      = each.value[1]
 
   index_config {}
 }
@@ -61,4 +96,9 @@ resource "google_firestore_backup_schedule" "daily" {
   database  = google_firestore_database.main.name
   retention = "${var.firestore_backup_retention_days * 86400}s"
   daily_recurrence {}
+}
+
+moved {
+  from = google_firestore_field.questions_unindexed
+  to   = google_firestore_field.unindexed["assessments/questions"]
 }

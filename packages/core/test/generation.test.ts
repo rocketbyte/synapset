@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   BudgetExhaustedError,
   GenerationService,
+  bankScopeKey,
+  questionText,
+  QuestionBank,
   LogUsageRecorder,
   MemoryLimitStore,
   SpendGuard,
@@ -12,8 +15,18 @@ import {
   TransientError,
   type GenerateMessage,
   type GenerationResult,
+  type Question,
 } from '@synapset/core';
-import { FakeEmbedder, FakeLlm, InMemoryRepository, assessment, questions, silentLogger } from './fakes.js';
+import {
+  FakeEmbedder,
+  FakeLlm,
+  InMemoryRepository,
+  assessment,
+  axisVector,
+  bankQuestion,
+  questions,
+  silentLogger,
+} from './fakes.js';
 
 const NOW = new Date('2026-10-26T12:00:00Z');
 const JOB_ID = 'c'.repeat(64);
@@ -46,6 +59,7 @@ describe('GenerationService', () => {
       repo,
       embedder,
       llm,
+      new QuestionBank(repo, embedder, { margin: 0.08 }, silentLogger, () => NOW),
       new SpendGuard(store, 1, () => NOW),
       usage,
       { leaseSeconds: 300, maxDeliveryAttempts: 5, verifyAnswers: true },
@@ -101,7 +115,7 @@ describe('GenerationService', () => {
 
     await expect(service(llm).handle(message, 1)).resolves.toBe('generated');
 
-    expect(llm.generatedPerLevel).toEqual([2]);
+    expect(llm.requests[0]?.counts).toEqual({ 1: 2, 2: 2, 3: 2 });
     expect(llm.verifyCalls).toBe(1);
     const stored = repo.assessments.get(JOB_ID);
     expect(stored?.questions.map((q) => q.q)).toEqual([
@@ -112,11 +126,95 @@ describe('GenerationService', () => {
     expect(stored?.usage).toEqual({ inputTokens: 600, outputTokens: 1000 });
   });
 
-  it('retries when too few questions survive the check', async () => {
+  it('tops up a shortfall within the attempt, keeping the questions that passed', async () => {
+    let round = 0;
+    const llm = new FakeLlm(
+      () => {
+        round++;
+        const batch = questions(2).map((q) => ({ ...q, q: `${q.q} (round ${round})` }));
+        return Promise.resolve({ ...successResult(), questions: batch });
+      },
+      (question) => question.d === 3 && question.q.endsWith('(round 1)'),
+    );
+
+    await expect(service(llm).handle(message, 1)).resolves.toBe('generated');
+
+    expect(llm.requests.map((r) => r.counts)).toEqual([
+      { 1: 2, 2: 2, 3: 2 },
+      { 1: 0, 2: 0, 3: 2 },
+    ]);
+    expect(repo.assessments.get(JOB_ID)?.questions.map((q) => q.q)).toEqual([
+      'Level 1 question 0? (round 1)',
+      'Level 2 question 0? (round 1)',
+      'Level 3 question 0? (round 2)',
+    ]);
+  });
+
+  it('retries when a level is still short after the last round', async () => {
     const llm = new FakeLlm(success, (question) => question.d === 3);
 
-    await expect(service(llm).handle(message, 1)).rejects.toThrow(/Expected 1 valid questions per level/);
+    await expect(service(llm).handle(message, 1)).rejects.toThrow(/difficulty 3 missing 1/);
+    expect(llm.calls).toBe(2);
     expect(repo.jobs.get(JOB_ID)?.status).toBe('pending');
+  });
+
+  describe('with questions reused from the bank', () => {
+    const BANK = bankScopeKey({
+      locale: 'en',
+      promptVersion: PROMPT_VERSION,
+      embeddingModel: 'fake-embedding',
+    });
+    const reused = [
+      bankQuestion(BANK, 1, 'easy', axisVector({ 1: 1 })),
+      bankQuestion(BANK, 3, 'hard', axisVector({ 3: 1 })),
+    ];
+    const withReuse = { ...message, context: 'Focus on lifetimes', reuse: reused.map((q) => q.id) };
+
+    beforeEach(async () => {
+      await repo.saveQuestions(reused);
+    });
+
+    it('generates only the missing levels, told what exists, and stores the new questions in the bank', async () => {
+      const llm = new FakeLlm(success);
+
+      await expect(service(llm).handle(withReuse, 1)).resolves.toBe('generated');
+
+      expect(llm.requests[0]).toMatchObject({
+        context: 'Focus on lifetimes',
+        counts: { 1: 0, 2: 2, 3: 0 },
+        existing: reused.map((q) => q.q),
+      });
+      const stored = repo.assessments.get(JOB_ID);
+      expect(stored?.questions.map((q) => [q.d, q.q])).toEqual([
+        [1, 'Bank easy at level 1?'],
+        [2, 'Level 2 question 0?'],
+        [3, 'Bank hard at level 3?'],
+      ]);
+      expect(stored).toMatchObject({ context: 'Focus on lifetimes', reusedQuestions: 2 });
+      const added = [...repo.bank.values()].filter((q) => q.sourceAssessmentId === JOB_ID);
+      expect(added.map((q) => q.q)).toEqual(['Level 2 question 0?']);
+    });
+
+    it('skips the LLM entirely when the reused questions cover every level', async () => {
+      const medium = bankQuestion(BANK, 2, 'medium', axisVector({ 2: 1 }));
+      await repo.saveQuestions([medium]);
+      const llm = new FakeLlm(success);
+
+      await service(llm).handle({ ...withReuse, reuse: [...withReuse.reuse, medium.id] }, 1);
+
+      expect(llm.calls).toBe(0);
+      expect(repo.assessments.get(JOB_ID)).toMatchObject({ reusedQuestions: 3, model: 'bank' });
+    });
+
+    it('drops generated questions that duplicate a reused one', async () => {
+      const [first, second] = questions(2).filter((q) => q.d === 2) as [Question, Question];
+      embedder.vectors.set(questionText(first), axisVector({ 1: 1, 9: 0.05 }));
+      const llm = new FakeLlm(() => Promise.resolve({ ...successResult(), questions: [first, second] }));
+
+      await service(llm).handle(withReuse, 1);
+
+      expect(repo.assessments.get(JOB_ID)?.questions.find((q) => q.d === 2)?.q).toBe(second.q);
+    });
   });
 
   it('fails queued jobs without calling the LLM once the budget is spent', async () => {

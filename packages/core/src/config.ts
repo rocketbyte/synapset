@@ -26,6 +26,16 @@ const ConfigSchema = z.object({
   SIMILARITY_THRESHOLD: z.coerce.number().gt(0).lt(1).default(0.88),
   /** Questions generated per difficulty level; callers may request fewer, never more. */
   QUESTIONS_PER_LEVEL: z.coerce.number().int().min(1).max(20).default(10),
+  /** Reuse relevant questions from earlier assessments instead of generating them. */
+  REUSE_QUESTIONS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  /**
+   * Similarity above a request's noise floor a bank question needs to be reused. Calibrated on
+   * gemini-embedding-2: 0.08 kept 96% precision at 59% recall; lower reuses more, less precisely.
+   */
+  QUESTION_REUSE_MARGIN: z.coerce.number().min(0).max(0.5).default(0.08),
   /** Blind-answer every generated question and drop those whose key the model disputes. */
   VERIFY_ANSWERS: z
     .enum(['true', 'false'])

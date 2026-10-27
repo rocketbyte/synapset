@@ -14,6 +14,7 @@ import { z } from 'zod';
 import {
   BudgetExhaustedError,
   LocaleSchema,
+  MAX_CONTEXT_LENGTH,
   MAX_TOPIC_LENGTH,
   QuotaExceededError,
   TransientError,
@@ -74,6 +75,16 @@ const ResolveBody = z.strictObject({
     .max(MAX_TOPIC_LENGTH)
     .describe('What to assess. Equivalent phrasings resolve to the same cached assessment.')
     .meta({ example: 'TCP congestion control' }),
+  context: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_CONTEXT_LENGTH)
+    .optional()
+    .describe(
+      'Guidance for the assessment: what to focus on, the audience, what to emphasise or avoid. Different context is a different assessment.',
+    )
+    .meta({ example: 'Focus on taxes: deductions, credits and how income tax is calculated.' }),
   locale: LocaleSchema.default('en').describe('Language of the questions'),
   ttlSeconds: z
     .number()
@@ -100,6 +111,7 @@ const GradeBody = z.strictObject({
 const AssessmentView = z.object({
   id: Id,
   topic: z.string(),
+  context: z.string().nullable(),
   locale: z.string(),
   questionsPerLevel: z.number().int().describe('Questions per difficulty level in this response'),
   createdAt: z.iso.datetime(),
@@ -118,7 +130,11 @@ const AssessmentView = z.object({
 const ReadyView = z
   .object({
     status: z.literal('ready'),
-    match: z.enum(['exact', 'semantic']).describe('Whether the topic matched verbatim or by meaning'),
+    match: z
+      .enum(['exact', 'semantic', 'composed'])
+      .describe(
+        'exact: same request seen before. semantic: an equivalent assessment exists. composed: assembled from existing questions on the subject, without generation.',
+      ),
     assessment: AssessmentView,
   })
   .describe('Served from cache');
@@ -192,6 +208,7 @@ const API_DESCRIPTION = `Turns a topic into a multiple-choice knowledge assessme
 const presentAssessment = (service: AssessmentService, a: Assessment, perLevel: number) => ({
   id: a.id,
   topic: a.topic,
+  context: a.context,
   locale: a.locale,
   questionsPerLevel: perLevel,
   createdAt: a.createdAt.toISOString(),
