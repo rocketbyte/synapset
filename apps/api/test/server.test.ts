@@ -85,7 +85,7 @@ describe('authentication', () => {
     expect(response.headers['content-type']).toMatch(/^application\/problem\+json/);
     expect(response.headers['www-authenticate']).toBe('Bearer realm="synapset"');
     expect(response.json()).toMatchObject({ status: 401, code: 'unauthorized', instance: '/v1/assessments' });
-    expect((await app.inject({ method: 'GET', url: '/healthz' })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200);
   });
 
   it('rejects unknown keys and throttles repeated failures per IP', async () => {

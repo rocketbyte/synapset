@@ -129,7 +129,7 @@ export KEY=<printed key>
 ```sh
 API=$(cd infra/terraform && terraform output -raw api_url)
 
-curl -s "$API/healthz"                                                   # {"status":"ok"}
+curl -s "$API/health"                                                   # {"status":"ok"}
 curl -s -i "$API/v1/usage"                                               # 401 problem+json
 curl -s "$API/v1/usage" -H "Authorization: Bearer $KEY"
 

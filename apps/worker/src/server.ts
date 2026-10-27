@@ -49,7 +49,7 @@ export function buildWorkerServer({ service, logger, projectId }: WorkerServerOp
     return reply.code(503).send();
   });
 
-  app.get('/healthz', { logLevel: 'silent' }, () => ({ status: 'ok' }));
+  app.get('/health', { logLevel: 'silent' }, () => ({ status: 'ok' }));
 
   app.post('/pubsub/generate', async (request, reply) => {
     const envelope = PushEnvelope.safeParse(request.body);

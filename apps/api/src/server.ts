@@ -228,7 +228,8 @@ export async function buildServer(options: ServerOptions) {
     clock,
   });
 
-  app.get('/healthz', { logLevel: 'silent', schema: { hide: true } }, () => ({ status: 'ok' }));
+  // Not /healthz: Cloud Run reserves paths ending in "z" and never routes them to the container.
+  app.get('/health', { logLevel: 'silent', schema: { hide: true } }, () => ({ status: 'ok' }));
   app.get('/openapi.json', { schema: { hide: true } }, () => app.swagger());
 
   app.post(
