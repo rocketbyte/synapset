@@ -4,6 +4,10 @@ Generates multiple-choice knowledge assessments for any topic, once. An assessme
 
 ## How it works
 
+Diagrams of the full architecture (request path, topic resolution, job lifecycle, limits, edge, delivery): [docs/architecture](docs/architecture/README.md).
+
+![System overview](docs/architecture/system-overview.png)
+
 ```
 Client ─▶ api (Cloud Run, public)
            1. in-memory LRU → 2. exact key (Firestore) → 3. alias → 4. embed + findNearest (COSINE)
