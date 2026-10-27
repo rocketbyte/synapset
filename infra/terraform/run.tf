@@ -79,9 +79,11 @@ resource "google_cloud_run_v2_service" "api" {
         }
       }
 
+      # The server listens only after it has fully initialised, so a TCP probe is enough, and it doesn't tie
+      # Terraform to a route in the image that CI deploys.
       startup_probe {
-        http_get {
-          path = "/health"
+        tcp_socket {
+          port = 8080
         }
       }
     }
@@ -175,9 +177,11 @@ resource "google_cloud_run_v2_service" "worker" {
         }
       }
 
+      # The server listens only after it has fully initialised, so a TCP probe is enough, and it doesn't tie
+      # Terraform to a route in the image that CI deploys.
       startup_probe {
-        http_get {
-          path = "/health"
+        tcp_socket {
+          port = 8080
         }
       }
     }
