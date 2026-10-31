@@ -10,6 +10,10 @@ locals {
     USAGE_TOPIC          = google_pubsub_topic.usage.name
     QUESTIONS_PER_LEVEL  = tostring(var.questions_per_level)
     LLM_DAILY_BUDGET_USD = tostring(var.llm_daily_budget_usd)
+
+    QUESTION_POOL_TTL_SECONDS     = tostring(var.question_pool_ttl_seconds)
+    QUESTION_POOL_CAP             = tostring(var.question_pool_cap)
+    QUESTION_POOL_BATCH_PER_LEVEL = tostring(var.question_pool_batch_per_level)
   }
 
   # Public CA certificate of the Memorystore instance; not a secret.

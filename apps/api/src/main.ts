@@ -6,6 +6,8 @@ import {
   FirestoreAssessmentRepository,
   FirestoreIdentityRepository,
   LogUsageRecorder,
+  PoolCaps,
+  PoolService,
   PubSubJobQueue,
   PubSubUsageRecorder,
   QuestionBank,
@@ -44,11 +46,27 @@ const bank = config.REUSE_QUESTIONS
       logger,
     )
   : undefined;
+const queue = new PubSubJobQueue(pubsub.topic(config.PUBSUB_TOPIC));
+const gate = new SpendGuard(limits.store, config.LLM_DAILY_BUDGET_USD);
+const pools = new PoolService(
+  repository,
+  embedder,
+  queue,
+  gate,
+  new PoolCaps(repository, config.QUESTION_POOL_CAP, logger),
+  {
+    ttlSeconds: config.QUESTION_POOL_TTL_SECONDS,
+    batchPerLevel: config.QUESTION_POOL_BATCH_PER_LEVEL,
+    sliceTtlSeconds: config.ASSESSMENT_TTL_SECONDS,
+    jobStaleSeconds: config.JOB_STALE_SECONDS,
+  },
+  { bank },
+);
 const service = new AssessmentService(
   repository,
   embedder,
-  new PubSubJobQueue(pubsub.topic(config.PUBSUB_TOPIC)),
-  new SpendGuard(limits.store, config.LLM_DAILY_BUDGET_USD),
+  queue,
+  gate,
   {
     questionsPerLevel: config.QUESTIONS_PER_LEVEL,
     similarityThreshold: config.SIMILARITY_THRESHOLD,
@@ -64,6 +82,7 @@ const service = new AssessmentService(
 
 const app = await buildServer({
   service,
+  pools,
   feedback: new FeedbackService(
     repository,
     { quarantineAfterReports: config.FEEDBACK_QUARANTINE_REPORTS },

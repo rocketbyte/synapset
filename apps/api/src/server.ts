@@ -13,17 +13,22 @@ import {
 import { z } from 'zod';
 import {
   BudgetExhaustedError,
+  AUDIENCES,
+  LEVELS,
   LocaleSchema,
   MAX_CONTEXT_LENGTH,
   MAX_STYLE_LENGTH,
   MAX_TOPIC_LENGTH,
+  QUESTION_TYPES,
   QuotaExceededError,
   REPORT_REASONS,
   REUSE_MODES,
+  TONES,
   TransientError,
   counterKeys,
   endOfUtcDay,
   endOfUtcMonth,
+  selectIndexes,
   traceBindings,
   type Assessment,
   type AssessmentService,
@@ -33,6 +38,7 @@ import {
   type Job,
   type LimitStore,
   type Logger,
+  type PoolService,
   type UsageRecorder,
 } from '@synapset/core';
 import { ProblemError, sendProblem } from './problems.js';
@@ -40,6 +46,7 @@ import { DOCS_PREFIX, registerSecurity } from './security.js';
 
 export interface ServerOptions {
   service: AssessmentService;
+  pools: PoolService;
   feedback: FeedbackService;
   authenticator: Authenticator;
   limits: LimitStore;
@@ -61,7 +68,8 @@ const Id = z
   .meta({ example: '3f9a1c0e5b7d2a4c6e8f0a1b3c5d7e9f1a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d' });
 const IdParams = z.strictObject({ id: Id });
 
-const MAX_QUESTIONS_PER_LEVEL = 20;
+/** The largest slice per level; plain assessments are held to the server's own, lower maximum. */
+const MAX_QUESTIONS_PER_LEVEL = 50;
 const QuestionsPerLevel = z
   .number()
   .int()
@@ -114,6 +122,70 @@ const ResolveBody = z.strictObject({
     .optional()
     .describe('How long a newly generated assessment stays cached. Capped by the server.'),
   questionsPerLevel: QuestionsPerLevel.optional(),
+});
+const Cursor = z
+  .string()
+  .regex(/^\d{1,5}\.\d{1,5}\.\d{1,5}$/, 'Expected a cursor returned by this API')
+  .describe('The slice.nextCursor of the previous slice. Omit to start at the beginning of the pool.');
+const NextBody = z.strictObject({
+  topic: z
+    .string()
+    .trim()
+    .min(2)
+    .max(MAX_TOPIC_LENGTH)
+    .describe('What to assess.')
+    .meta({ example: 'PostgreSQL' }),
+  context: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_CONTEXT_LENGTH)
+    .optional()
+    .describe(
+      'What the topic means here and what to cover. Part of what identifies the pool, so keep it stable and never put anything about a person in it.',
+    )
+    .meta({ example: 'The relational database, as used by software engineers.' }),
+  locale: LocaleSchema.default('en').describe('Language of the questions'),
+  audience: z.enum(AUDIENCES).default('adults').describe('Who the questions are written for'),
+  tone: z.enum(TONES).default('neutral').describe('How the questions sound'),
+  questionTypes: z
+    .array(z.enum(QUESTION_TYPES))
+    .min(1)
+    .max(QUESTION_TYPES.length)
+    .default(['conceptual', 'scenario'])
+    .describe('The types to spread the questions across. A different set is a different pool.'),
+  levels: z
+    .array(z.union(LEVELS.map((level) => z.literal(level))))
+    .min(1)
+    .max(LEVELS.length)
+    .default([...LEVELS])
+    .describe('Difficulty levels to include: 1 (basic) to 3 (advanced)'),
+  questionsPerLevel: QuestionsPerLevel,
+  poolSize: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      'The most questions you want behind this topic, shared across the levels. Never raises the server cap, only lowers it for this request.',
+    )
+    .meta({ example: 100 }),
+  cursor: Cursor.optional(),
+  revisit: z
+    .number()
+    .int()
+    .min(0)
+    .max(20)
+    .default(0)
+    .describe('Earlier questions to mix in at random, counted within the slice.'),
+  seed: z
+    .string()
+    .min(1)
+    .max(64)
+    .optional()
+    .describe(
+      'Varies the random part. The same request with the same seed returns the same slice, so a retry is safe; change it per attempt. Must not identify a person.',
+    ),
 });
 const AssessmentQuery = z.strictObject({
   questionsPerLevel: z.coerce.number().pipe(QuestionsPerLevel).optional(),
@@ -170,9 +242,24 @@ const AssessmentView = z.object({
         q: z.string().describe('Question text'),
         o: z.array(z.string()).describe('Four options'),
         d: z.number().int().describe('Difficulty level: 1 (basic) to 3 (advanced)'),
+        id: Id.optional().describe('Stable question id. Slices only.'),
+        type: z.enum(QUESTION_TYPES).optional().describe('Question type. Slices only.'),
       }),
     )
     .describe('Answers and explanations are released only by grading'),
+  slice: z
+    .object({
+      audience: z.enum(AUDIENCES),
+      tone: z.enum(TONES),
+      mode: z
+        .enum(['fresh', 'wrapping', 'random'])
+        .describe(
+          'fresh: new questions, plus any revisited. wrapping: the last new ones topped up with earlier ones. random: nothing new is left, so all are drawn at random.',
+        ),
+      nextCursor: Cursor.describe('Send this to continue after this slice'),
+    })
+    .optional()
+    .describe('Set when the assessment is a slice of a pool'),
 });
 const ReadyView = z
   .object({
@@ -185,6 +272,17 @@ const ReadyView = z
     assessment: AssessmentView,
   })
   .describe('Served from cache');
+const SliceView = z
+  .object({
+    status: z.literal('ready'),
+    pool: z.object({
+      size: z.number().int().describe('Questions available to this request'),
+      limit: z.number().int().describe('The most this request can reach: server caps and poolSize applied'),
+      exhausted: z.boolean().describe('Nothing new is left after this slice'),
+    }),
+    assessment: AssessmentView,
+  })
+  .describe('A slice, served without generation');
 const JobView = z
   .object({
     jobId: Id,
@@ -245,6 +343,8 @@ const API_DESCRIPTION = `Turns a topic into a multiple-choice knowledge assessme
 
 **Question count.** Pass \`questionsPerLevel\` to get fewer questions than the server generates (three difficulty levels, so \`5\` returns 15). Each topic is generated once at the maximum, so any count is served from the same cached assessment. Use the same count when fetching and grading.
 
+**Question pools.** \`POST /v1/pools/next\` serves slices of a pool of questions kept per topic, audience, tone and difficulty. You hold the cursor; the service keeps nothing about your users. Questions are generated only when a slice needs ones that do not exist, and never again after that. Slices are assessments: fetch, grade and report them the same way.
+
 **Answer checking.** Before an assessment is stored, a second model pass answers every question without the key. Questions it answers differently, or finds ambiguous, are discarded.
 
 **Limits.** Every authenticated response carries \`RateLimit-Limit\`, \`RateLimit-Remaining\` and \`RateLimit-Reset\`. A \`429\` or \`503\` carries \`Retry-After\`.
@@ -261,7 +361,24 @@ const presentAssessment = (service: AssessmentService, a: Assessment, perLevel: 
   questionsPerLevel: perLevel,
   createdAt: a.createdAt.toISOString(),
   expiresAt: a.expiresAt.toISOString(),
-  questions: service.questionsFor(a, perLevel).map(({ q, o, d }, i) => ({ i, q, o, d })),
+  questions: service.questionsFor(a, perLevel).map(({ q, o, d, t }, i) => ({
+    i,
+    q,
+    o,
+    d,
+    ...(a.slice ? { id: a.questionIds[selectIndexes(a.questions, perLevel)[i] as number] } : {}),
+    ...(a.slice && t ? { type: t } : {}),
+  })),
+  ...(a.slice
+    ? {
+        slice: {
+          audience: a.slice.audience,
+          tone: a.slice.tone,
+          mode: a.slice.mode,
+          nextCursor: a.slice.nextCursor,
+        },
+      }
+    : {}),
 });
 
 /** Internal error text stays in the logs; clients get a stable code. */
@@ -285,9 +402,9 @@ export async function buildServer(options: ServerOptions) {
   const { service, limits, projectId } = options;
   const clock = options.clock ?? (() => new Date());
 
-  /** Requests may ask for fewer questions than were generated, never more. */
-  const perLevel = (requested: number | undefined) => {
-    const max = service.maxQuestionsPerLevel;
+  /** Requests may ask for fewer questions than were generated, never more. A slice has its own size. */
+  const perLevel = (requested: number | undefined, assessment?: Assessment) => {
+    const max = assessment?.slice?.questionsPerLevel ?? service.maxQuestionsPerLevel;
     if (requested === undefined) return max;
     if (requested > max) {
       throw new ProblemError({
@@ -380,6 +497,7 @@ export async function buildServer(options: ServerOptions) {
       info: { title: 'Synapset Assessments API', version: '1.0.0', description: API_DESCRIPTION },
       tags: [
         { name: 'Assessments', description: 'Resolve, fetch and grade assessments' },
+        { name: 'Pools', description: 'Serve slices of long-lived question pools' },
         { name: 'Jobs', description: 'Track generation of new assessments' },
         { name: 'Usage', description: 'Consumption against the plan' },
       ],
@@ -455,6 +573,47 @@ export async function buildServer(options: ServerOptions) {
     },
   );
 
+  app.post(
+    '/v1/pools/next',
+    {
+      config: { scope: 'assessments:write' },
+      schema: {
+        operationId: 'nextPoolSlice',
+        tags: ['Pools'],
+        summary: 'Get the next slice of a question pool',
+        description:
+          'Returns the slice after the cursor, as an assessment to fetch, grade and report like any other. When the pool lacks new questions it first takes relevant ones from the bank, then queues a generation of only what is still missing and returns the job; when the job is done, send the same request again. Past the end of a pool, slices are drawn at random. Pool content lifetime and caps are server configuration and cannot be set per request.',
+        body: NextBody,
+        response: { 200: SliceView, 202: JobView, ...errors(400, 401, 403, 429, 503) },
+      },
+    },
+    async (request, reply) => {
+      const { questionTypes, ...body } = request.body;
+      const result = await options.pools.next(
+        { ...body, types: questionTypes },
+        request.principal as NonNullable<typeof request.principal>,
+      );
+      if (result.status === 'ready') {
+        request.match = 'pool';
+        return reply.code(200).send({
+          status: 'ready' as const,
+          pool: result.pool,
+          assessment: presentAssessment(
+            service,
+            result.assessment,
+            result.assessment.slice?.questionsPerLevel ?? body.questionsPerLevel,
+          ),
+        });
+      }
+      request.generationQueued = true;
+      return reply
+        .code(202)
+        .header('location', `/v1/jobs/${result.job.id}`)
+        .header('retry-after', RETRY_AFTER_SECONDS)
+        .send(presentJob(result.job));
+    },
+  );
+
   app.get(
     '/v1/assessments/:id',
     {
@@ -471,9 +630,9 @@ export async function buildServer(options: ServerOptions) {
       },
     },
     async (request, reply) => {
-      const count = perLevel(request.query.questionsPerLevel);
       const assessment = await service.get(request.params.id);
       if (!assessment) return sendProblem(reply, { status: 404, code: 'not_found' });
+      const count = perLevel(request.query.questionsPerLevel, assessment);
       return reply.code(200).send(presentAssessment(service, assessment, count));
     },
   );
@@ -494,9 +653,9 @@ export async function buildServer(options: ServerOptions) {
       },
     },
     async (request, reply) => {
-      const count = perLevel(request.body.questionsPerLevel);
       const assessment = await service.get(request.params.id);
       if (!assessment) return sendProblem(reply, { status: 404, code: 'not_found' });
+      const count = perLevel(request.body.questionsPerLevel, assessment);
       const { answers } = request.body;
       const expected = service.questionsFor(assessment, count).length;
       if (answers.length !== expected) {
@@ -527,9 +686,9 @@ export async function buildServer(options: ServerOptions) {
     },
     async (request, reply) => {
       const { questionsPerLevel, i, reason, comment } = request.body;
-      const count = perLevel(questionsPerLevel);
       const assessment = await service.get(request.params.id);
       if (!assessment) return sendProblem(reply, { status: 404, code: 'not_found' });
+      const count = perLevel(questionsPerLevel, assessment);
       const outcome = await options.feedback.report(
         { assessment, questionsPerLevel: count, index: i, reason, comment: comment || undefined },
         request.principal as NonNullable<typeof request.principal>,

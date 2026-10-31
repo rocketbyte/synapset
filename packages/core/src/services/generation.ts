@@ -3,6 +3,7 @@ import type { Logger } from 'pino';
 import {
   bankQuestionId,
   bankScopeKey,
+  conceptKey,
   isFresh,
   normalizeTopic,
   requestText,
@@ -13,7 +14,7 @@ import {
   type LevelCounts,
 } from '../domain.js';
 import { InvalidOutputError, PermanentError, TransientError } from '../errors.js';
-import { PROMPT_VERSION } from '../prompt.js';
+import { PROMPT_VERSION, type PoolBrief } from '../prompt.js';
 import { LEVELS, type BankQuestion, type GenerateMessage, type Question } from '../schemas.js';
 import type {
   AssessmentRepository,
@@ -48,6 +49,9 @@ export function keepVerified(questions: readonly Question[], verdicts: readonly 
 
 /** Paid generation calls per attempt; each later round asks only for what earlier ones left missing. */
 const GENERATION_ROUNDS = 2;
+/** A pool level that yields under half of what was asked has run out of new concepts for now. */
+const SATURATION_RATIO = 0.5;
+const SATURATION_BACKOFF_MS = 30 * 86_400_000;
 
 /** Every outcome acknowledges the message; retryable failures throw instead. */
 export type GenerationOutcome = 'generated' | 'already-done' | 'skipped' | 'failed';
@@ -80,6 +84,8 @@ export class GenerationService {
           `Message built for prompt ${message.promptVersion}, worker runs ${PROMPT_VERSION}`,
         );
       }
+
+      if (message.pool) return await this.fillPool(message, message.pool, log);
 
       const existing = await this.repo.getAssessment(message.jobId);
       if (existing && isFresh(existing, this.clock())) {
@@ -197,9 +203,78 @@ export class GenerationService {
   }
 
   /**
+   * Adds new questions to a pool. Everything the pool holds is passed in so nothing is written twice, by
+   * text, by meaning or by concept. A subject that runs out of concepts is not an error: the level is
+   * marked saturated and keeps what it has, so generation stops paying for rejected repeats.
+   */
+  private async fillPool(
+    message: GenerateMessage,
+    target: NonNullable<GenerateMessage['pool']>,
+    log: Logger,
+  ): Promise<GenerationOutcome> {
+    const pool = await this.repo.getPool(target.id);
+    if (!pool) throw new PermanentError(`Pool ${target.id} no longer exists`);
+    const held = await this.bank.get(LEVELS.flatMap((level) => pool.levels[level]).map(({ id }) => id));
+    const brief: PoolBrief = {
+      audience: pool.audience,
+      tone: pool.tone,
+      types: pool.types,
+      covered: LEVELS.flatMap((level) => pool.levels[level]).map((entry) => entry.concept),
+    };
+
+    const result = await this.generate(message, target.counts, held, pool.scope, log, brief);
+    const accepted = result.questions.map(({ question, embedding }) => ({
+      // The model may skip a label; a pool's question always has both.
+      question: {
+        ...question,
+        t: question.t && pool.types.includes(question.t) ? question.t : pool.types[0],
+        c: question.c?.trim() || question.q,
+      },
+      embedding,
+    }));
+    const wanted = LEVELS.reduce((sum, level) => sum + target.counts[level], 0);
+    if (wanted > 0 && accepted.length === 0) {
+      throw new InvalidOutputError('Pool generation produced no usable question');
+    }
+
+    const now = this.clock();
+    const expiresAt = new Date(now.getTime() + message.ttlSeconds * 1000);
+    await this.bank.add(
+      accepted.map(({ question }) => question),
+      accepted.map(({ embedding }) => embedding),
+      pool.scope,
+      pool.id,
+      expiresAt,
+    );
+    const saturatedUntil = Object.fromEntries(
+      LEVELS.filter((level) => {
+        const got = accepted.filter(({ question }) => question.d === level).length;
+        return target.counts[level] > 0 && got < target.counts[level] * SATURATION_RATIO;
+      }).map((level) => [level, now.getTime() + SATURATION_BACKOFF_MS]),
+    );
+    await this.repo.appendToPool(
+      pool.id,
+      accepted.map(({ question }) => ({
+        ...question,
+        id: bankQuestionId(pool.scope, question),
+        expiresAt,
+      })),
+      saturatedUntil,
+      now,
+    );
+    await this.repo.completeJob(message.jobId, pool.id, now);
+    log.info(
+      { ...result.usage, costUsd: result.costUsd, added: accepted.length, saturated: saturatedUntil },
+      'Pool grown',
+    );
+    return 'generated';
+  }
+
+  /**
    * Writes the questions the bank could not supply (plus spares), checks their answers, and drops any that
    * duplicate a reused or already accepted question. Questions that pass are kept between rounds, so a
-   * shortfall costs only the missing questions. Still short after the last round is retryable.
+   * shortfall costs only the missing questions. Still short after the last round is retryable, except for
+   * a pool (`brief`), where what was accepted is kept.
    */
   private async generate(
     message: GenerateMessage,
@@ -207,6 +282,7 @@ export class GenerationService {
     reused: readonly BankQuestion[],
     bankScope: string,
     log: Logger,
+    brief?: PoolBrief,
   ) {
     const accepted: { question: Question; embedding: number[] }[] = [];
     const usage = { inputTokens: 0, outputTokens: 0 };
@@ -227,9 +303,24 @@ export class GenerationService {
       await this.spend.assertBudgetAvailable();
       const existing = [
         ...reused,
-        ...accepted.map(({ question, embedding }) => ({ q: question.q, embedding })),
+        ...accepted.map(({ question, embedding }) => ({
+          q: question.q,
+          embedding,
+          d: question.d,
+          c: question.c,
+        })),
       ];
-      const result = await this.generateRound(message, gap, existing, bankScope, log);
+      const result = await this.generateRound(
+        message,
+        gap,
+        existing,
+        bankScope,
+        log,
+        brief && {
+          ...brief,
+          covered: [...brief.covered, ...accepted.flatMap(({ question }) => question.c ?? [])],
+        },
+      );
       usage.inputTokens += result.usage.inputTokens;
       usage.outputTokens += result.usage.outputTokens;
       costUsd += result.costUsd;
@@ -240,7 +331,7 @@ export class GenerationService {
 
     const gap = missing();
     const short = LEVELS.filter((level) => gap[level] > 0);
-    if (short.length > 0) {
+    if (short.length > 0 && !brief) {
       throw new InvalidOutputError(
         `Too few valid questions after ${GENERATION_ROUNDS} rounds: ${short.map((level) => `difficulty ${level} missing ${gap[level]}`).join(', ')}`,
       );
@@ -258,9 +349,10 @@ export class GenerationService {
   private async generateRound(
     message: GenerateMessage,
     gap: LevelCounts,
-    existing: readonly { q: string; embedding: number[] }[],
+    existing: readonly { q: string; embedding: number[]; d?: number; c?: string | undefined }[],
     bankScope: string,
     log: Logger,
+    brief?: PoolBrief,
   ) {
     const { verifyAnswers } = this.options;
     const requested = Object.fromEntries(
@@ -275,15 +367,22 @@ export class GenerationService {
       style: message.style,
       locale: message.locale,
       counts: requested,
-      existing: existing.map((question) => question.q),
+      // A pool's concepts stand in for its questions, which could be thousands of tokens.
+      existing: brief ? [] : existing.map((question) => question.q),
+      pool: brief,
     });
     let costUsd = await this.recordCost(message, result, log);
     const usage = { ...result.usage };
 
     const existingTexts = new Set(existing.map((question) => question.q.trim().toLowerCase()));
+    const coveredConcepts = new Set(
+      existing.flatMap(({ c, d }) => (c && d !== undefined ? [conceptKey(d, c)] : [])),
+    );
     const fresh = usableQuestions(result.questions).filter(
       (question) =>
-        gap[question.d as keyof LevelCounts] > 0 && !existingTexts.has(question.q.trim().toLowerCase()),
+        gap[question.d as keyof LevelCounts] > 0 &&
+        !existingTexts.has(question.q.trim().toLowerCase()) &&
+        !(question.c && coveredConcepts.has(conceptKey(question.d, question.c))),
     );
     // Questions users reported into quarantine stay out, even when the model writes them again.
     const blocked = await this.bank.quarantined(fresh.map((question) => bankQuestionId(bankScope, question)));

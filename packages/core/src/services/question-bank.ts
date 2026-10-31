@@ -1,6 +1,6 @@
 import type { Logger } from 'pino';
 import { EMBEDDING_DIMENSIONS } from '../config.js';
-import { bankQuestionId, cosine, questionText, type LevelCounts } from '../domain.js';
+import { bankQuestionId, conceptKey, cosine, questionText, type LevelCounts } from '../domain.js';
 import { LEVELS, type BankQuestion, type Question, type ReuseMode } from '../schemas.js';
 import type { AssessmentRepository, Clock, Embedder } from '../ports.js';
 
@@ -154,6 +154,25 @@ export class QuestionBank {
         kept.some((other) => cosine(other.embedding, embedding) >= NEAR_DUPLICATE);
       if (!duplicate) kept.push({ question, embedding });
     });
+    return kept;
+  }
+
+  /** `candidates` without those that test the same idea as a question already held, or as each other. */
+  withoutDuplicates<T extends { embedding: number[]; d: number; c?: string | undefined }>(
+    candidates: readonly T[],
+    held: readonly { embedding: number[]; d: number; c?: string | undefined }[],
+  ): T[] {
+    const concepts = new Set(held.flatMap((q) => (q.c ? [conceptKey(q.d, q.c)] : [])));
+    const kept: T[] = [];
+    for (const candidate of candidates) {
+      const key = candidate.c ? conceptKey(candidate.d, candidate.c) : null;
+      if (key && concepts.has(key)) continue;
+      const near = (other: { embedding: number[] }) =>
+        cosine(other.embedding, candidate.embedding) >= NEAR_DUPLICATE;
+      if (held.some(near) || kept.some(near)) continue;
+      if (key) concepts.add(key);
+      kept.push(candidate);
+    }
     return kept;
   }
 

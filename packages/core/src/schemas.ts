@@ -12,6 +12,24 @@ export const MAX_STYLE_LENGTH = 300;
 export const REUSE_MODES = ['auto', 'strict', 'off'] as const;
 export type ReuseMode = (typeof REUSE_MODES)[number];
 
+/** Who a pool's questions are written for. Part of what identifies a pool. */
+export const AUDIENCES = ['children', 'teens', 'adults'] as const;
+export type Audience = (typeof AUDIENCES)[number];
+
+/** How a pool's questions sound. Part of what identifies a pool. */
+export const TONES = ['neutral', 'friendly', 'professional', 'academic'] as const;
+export type Tone = (typeof TONES)[number];
+
+/** What a question asks the reader to do. */
+export const QUESTION_TYPES = [
+  'conceptual',
+  'scenario',
+  'applied',
+  'troubleshooting',
+  'calculation',
+] as const;
+export type QuestionType = (typeof QUESTION_TYPES)[number];
+
 export const REPORT_REASONS = ['wrong_answer', 'ambiguous', 'off_topic', 'outdated', 'other'] as const;
 export type ReportReason = (typeof REPORT_REASONS)[number];
 
@@ -22,6 +40,8 @@ export const QuestionSchema = z.object({
   a: z.number().int().describe('0-based index of the single correct option'),
   e: z.string().describe('One-sentence explanation of the correct answer'),
   d: z.number().int().describe('Difficulty: 1 easy, 2 medium, 3 hard'),
+  t: z.enum(QUESTION_TYPES).optional().describe('Question type, when the request lists types'),
+  c: z.string().optional().describe('The concept tested, in a few words, when the request asks for it'),
 });
 export type Question = z.infer<typeof QuestionSchema>;
 
@@ -65,6 +85,17 @@ export const GenerateMessageSchema = z.object({
   embedding: z.array(z.number()).length(EMBEDDING_DIMENSIONS).optional(),
   /** Bank questions the API selected for reuse; the worker generates only what they leave missing. */
   reuse: z.array(z.string()).optional(),
+  /** Set when the job grows a pool: the new questions wanted per level. Nothing here is an assessment. */
+  pool: z
+    .object({
+      id: z.string().min(1),
+      counts: z.object({
+        1: z.number().int().min(0),
+        2: z.number().int().min(0),
+        3: z.number().int().min(0),
+      }),
+    })
+    .optional(),
 });
 export type GenerateMessage = z.infer<typeof GenerateMessageSchema>;
 
@@ -94,6 +125,49 @@ export interface Assessment {
   reusedQuestions: number;
   /** Bank id of each question, in order; lets a quarantined question invalidate every assessment using it. */
   questionIds: string[];
+  /** Set when the assessment is a slice of a pool. */
+  slice?: AssessmentSlice | undefined;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+export interface AssessmentSlice {
+  poolId: string;
+  audience: Audience;
+  tone: Tone;
+  mode: 'fresh' | 'wrapping' | 'random';
+  /** What the consumer sends to continue after this slice. */
+  nextCursor: string;
+  questionsPerLevel: number;
+}
+
+/** A question's place in a pool. Entries are only ever added at the end, so cursors stay valid. */
+export interface PoolEntry {
+  id: string;
+  /** Concept tested: tells the model what not to write again, at far fewer tokens than the questions. */
+  concept: string;
+  /** Epoch milliseconds. Live positions are what a cursor counts, so old questions lapse by themselves. */
+  expiresAt: number;
+}
+
+/**
+ * The questions behind one topic for one audience, tone and set of question types, per difficulty. Holds
+ * nothing about any consumer.
+ */
+export interface QuestionPool {
+  id: string;
+  topic: string;
+  topicNormalized: string;
+  context: string | null;
+  locale: string;
+  audience: Audience;
+  tone: Tone;
+  types: QuestionType[];
+  /** Bank scope of its questions. */
+  scope: string;
+  levels: Record<1 | 2 | 3, PoolEntry[]>;
+  /** Epoch milliseconds per level: the subject ran out of new concepts, so generation waits until then. */
+  saturatedUntil: Partial<Record<1 | 2 | 3, number>>;
   createdAt: Date;
   expiresAt: Date;
 }

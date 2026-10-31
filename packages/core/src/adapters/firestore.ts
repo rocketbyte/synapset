@@ -7,7 +7,9 @@ import {
   type Firestore,
   type VectorValue,
 } from '@google-cloud/firestore';
-import type { Assessment, BankQuestion, Job, QuestionReport } from '../schemas.js';
+import { PermanentError } from '../errors.js';
+import { withQuestions, type PoolCapRule } from '../pools.js';
+import type { Assessment, BankQuestion, Job, QuestionPool, QuestionReport } from '../schemas.js';
 import type { AssessmentRepository, LeaseResult, NearestMatch, NewJob, QuestionMatch } from '../ports.js';
 
 const DISTANCE_FIELD = '_distance';
@@ -37,6 +39,7 @@ function toAssessment(snapshot: DocumentSnapshot): Assessment {
     usage: d.usage as Assessment['usage'],
     reusedQuestions: (d.reusedQuestions as number | undefined) ?? 0,
     questionIds: (d.questionIds as string[] | undefined) ?? [],
+    ...(d.slice ? { slice: d.slice as NonNullable<Assessment['slice']> } : {}),
     createdAt: toDate(d.createdAt),
     expiresAt: toDate(d.expiresAt),
   };
@@ -51,12 +54,33 @@ function toBankQuestion(snapshot: DocumentSnapshot): BankQuestion {
     a: d.a as number,
     e: d.e as string,
     d: d.d as number,
+    ...(d.t ? { t: d.t as NonNullable<BankQuestion['t']> } : {}),
+    ...(d.c ? { c: d.c as string } : {}),
     scope: d.scope as string,
     // Quarantine records created from a report carry no embedding.
     embedding: (d.embedding as VectorValue | undefined)?.toArray() ?? [],
     sourceAssessmentId: (d.sourceAssessmentId as string | undefined) ?? '',
     status: (d.status as BankQuestion['status'] | undefined) ?? 'active',
     reports: (d.reports as number | undefined) ?? 0,
+    createdAt: toDate(d.createdAt),
+    expiresAt: toDate(d.expiresAt),
+  };
+}
+
+function toPool(snapshot: DocumentSnapshot): QuestionPool {
+  const d = snapshot.data() as DocumentData;
+  return {
+    id: snapshot.id,
+    topic: d.topic as string,
+    topicNormalized: d.topicNormalized as string,
+    context: (d.context as string | null | undefined) ?? null,
+    locale: d.locale as string,
+    audience: d.audience as QuestionPool['audience'],
+    tone: d.tone as QuestionPool['tone'],
+    types: d.types as QuestionPool['types'],
+    scope: d.scope as string,
+    levels: d.levels as QuestionPool['levels'],
+    saturatedUntil: (d.saturatedUntil as QuestionPool['saturatedUntil'] | undefined) ?? {},
     createdAt: toDate(d.createdAt),
     expiresAt: toDate(d.expiresAt),
   };
@@ -101,6 +125,8 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
   private readonly jobs: CollectionReference;
   private readonly questions: CollectionReference;
   private readonly reports: CollectionReference;
+  private readonly pools: CollectionReference;
+  private readonly settings: CollectionReference;
 
   constructor(private readonly db: Firestore) {
     this.questions = db.collection('questions');
@@ -108,6 +134,8 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
     this.assessments = db.collection('assessments');
     this.aliases = db.collection('topic_keys');
     this.jobs = db.collection('jobs');
+    this.pools = db.collection('question_pools');
+    this.settings = db.collection('settings');
   }
 
   async getAssessment(id: string): Promise<Assessment | null> {
@@ -147,11 +175,12 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
     await this.aliases.doc(key).set({ assessmentId, expiresAt: Timestamp.fromDate(expiresAt) });
   }
 
-  async saveAssessment(assessment: Assessment, embedding: number[]): Promise<void> {
-    const { id, createdAt, expiresAt, ...fields } = assessment;
+  async saveAssessment(assessment: Assessment, embedding: number[] | null): Promise<void> {
+    const { id, createdAt, expiresAt, slice, ...fields } = assessment;
     await this.assessments.doc(id).set({
       ...fields,
-      embedding: FieldValue.vector(embedding),
+      ...(slice ? { slice } : {}),
+      ...(embedding ? { embedding: FieldValue.vector(embedding) } : {}),
       createdAt: Timestamp.fromDate(createdAt),
       expiresAt: Timestamp.fromDate(expiresAt),
     });
@@ -215,6 +244,56 @@ export class FirestoreAssessmentRepository implements AssessmentRepository {
       }
       await batch.commit();
     }
+  }
+
+  async getPool(id: string): Promise<QuestionPool | null> {
+    const snapshot = await this.pools.doc(id).get();
+    return snapshot.exists ? toPool(snapshot) : null;
+  }
+
+  createPool(pool: QuestionPool): Promise<QuestionPool> {
+    const ref = this.pools.doc(pool.id);
+    return this.db.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      if (snapshot.exists) return toPool(snapshot);
+      const { id: _id, createdAt, expiresAt, ...fields } = pool;
+      tx.create(ref, {
+        ...fields,
+        createdAt: Timestamp.fromDate(createdAt),
+        expiresAt: Timestamp.fromDate(expiresAt),
+      });
+      return pool;
+    });
+  }
+
+  appendToPool(
+    id: string,
+    questions: readonly Pick<BankQuestion, 'id' | 'd' | 'c' | 'q' | 'expiresAt'>[],
+    saturatedUntil: QuestionPool['saturatedUntil'],
+    now: Date,
+  ): Promise<QuestionPool> {
+    const ref = this.pools.doc(id);
+    return this.db.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      if (!snapshot.exists) throw new PermanentError(`Pool ${id} no longer exists`);
+      const pool = toPool(snapshot);
+      const updated = withQuestions(pool, questions, saturatedUntil, now);
+      tx.update(ref, {
+        levels: updated.levels,
+        saturatedUntil: updated.saturatedUntil,
+        expiresAt: Timestamp.fromDate(updated.expiresAt),
+      });
+      return updated;
+    });
+  }
+
+  async getPoolCapRules(): Promise<PoolCapRule[]> {
+    const snapshot = await this.settings.doc('question_pools').get();
+    return (snapshot.get('capRules') as PoolCapRule[] | undefined) ?? [];
+  }
+
+  async savePoolCapRules(rules: readonly PoolCapRule[]): Promise<void> {
+    await this.settings.doc('question_pools').set({ capRules: rules }, { merge: true });
   }
 
   recordReport(report: QuestionReport): Promise<boolean> {
