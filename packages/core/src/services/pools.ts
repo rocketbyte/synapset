@@ -250,12 +250,16 @@ export class PoolService {
     return { 1: limitFor(1), 2: limitFor(2), 3: limitFor(3) };
   }
 
-  /** New questions to ask for: a full batch, so one fill serves several slices, within each level's limit. */
+  /** New questions to ask for: a full batch, or the slice's need if larger, within each level's limit. */
   private fill(pool: QuestionPool, short: Partial<LevelCounts>, limits: LevelCounts, now: Date): LevelCounts {
-    const count = (level: Level) =>
-      short[level] === undefined
-        ? 0
-        : Math.min(this.options.batchPerLevel, limits[level] - liveEntries(pool, level, now).length);
+    const count = (level: Level) => {
+      const need = short[level];
+      if (need === undefined) return 0;
+      return Math.min(
+        Math.max(this.options.batchPerLevel, need),
+        limits[level] - liveEntries(pool, level, now).length,
+      );
+    };
     return { 1: count(1), 2: count(2), 3: count(3) };
   }
 
