@@ -151,6 +151,48 @@ Unknown fields are rejected with `400`.
 
 Calling `POST` again with the same topic is safe. It returns `202` with the same job while generation runs, and `200` once the assessment exists. Polling the job is cheaper.
 
+### Get the next slice of a question pool
+
+`POST /v1/pools/next` · scope `assessments:write`
+
+Use this when people take a topic more than once. Behind each topic is a pool per audience, tone and difficulty. You keep a cursor per user; Synapset keeps nothing about your users.
+
+```json
+{
+  "topic": "PostgreSQL",
+  "context": "The relational database, as used by software engineers.",
+  "audience": "adults",
+  "tone": "professional",
+  "questionTypes": ["conceptual", "scenario", "troubleshooting"],
+  "questionsPerLevel": 4,
+  "poolSize": 100,
+  "cursor": "9.8.8",
+  "revisit": 3,
+  "seed": "attempt-2"
+}
+```
+
+| Field               | Type      | Required | Rules                                                                                                                                             |
+| ------------------- | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `topic`             | string    | yes      | 2–120 characters                                                                                                                                  |
+| `questionsPerLevel` | integer   | yes      | 1–50                                                                                                                                              |
+| `context`           | string    | no       | What the topic means and what to cover. Part of the pool's identity: keep it stable, and never put anything about a person in it                  |
+| `locale`            | string    | no       | Default `en`                                                                                                                                      |
+| `audience`          | string    | no       | `children`, `teens` or `adults` (default)                                                                                                         |
+| `tone`              | string    | no       | `neutral` (default), `friendly`, `professional` or `academic`                                                                                     |
+| `questionTypes`     | string[]  | no       | `conceptual`, `scenario`, `applied`, `troubleshooting`, `calculation`. Default conceptual and scenario. A different set is a different pool       |
+| `levels`            | integer[] | no       | Difficulty levels to include. Default `[1, 2, 3]`                                                                                                 |
+| `poolSize`          | integer   | no       | The most questions you want behind the topic, shared across levels. Lowers the server cap for this request; never raises it                       |
+| `cursor`            | string    | no       | `slice.nextCursor` of the previous slice. Omit to start                                                                                           |
+| `revisit`           | integer   | no       | 0–20. Earlier questions to mix in at random, counted within the slice                                                                             |
+| `seed`              | string    | no       | Varies the random part. The same request and seed return the same slice, so a retry is safe. Change it per attempt; it must not identify a person |
+
+Returns `200` with `{ "status": "ready", "pool": { "size", "limit", "exhausted" }, "assessment": … }`, or `202` with a job when questions have to be written first. When the job is `done`, send the same request again. Only that generation counts against your quota; if the quota is spent, you get a slice from what exists instead of an error.
+
+The assessment is an ordinary one: fetch, grade and report it by id. Each question also carries its `id` and `type`, and `assessment.slice` has `audience`, `tone`, `mode` and `nextCursor`. Store `nextCursor` once the attempt is finished. `mode` is `fresh`, `wrapping` (the last new questions, topped up with earlier ones) or `random` (nothing new is left, so every question is drawn at random).
+
+Question lifetime and caps are set by the service, and there is no field for them.
+
 ### Get a job
 
 `GET /v1/jobs/{jobId}` · scope `assessments:read`

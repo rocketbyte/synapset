@@ -1,5 +1,5 @@
 import type { LevelCounts } from './domain.js';
-import { LEVELS, type Question } from './schemas.js';
+import { LEVELS, type Audience, type Question, type QuestionType, type Tone } from './schemas.js';
 
 /**
  * Bump whenever the prompts, or how their output is checked, change: it is part of the cache scope, so
@@ -40,12 +40,66 @@ export interface PromptInput {
   counts: LevelCounts;
   /** Question texts already in the assessment, to avoid duplicating. */
   existing?: readonly string[] | undefined;
+  /** Set when writing for a pool. */
+  pool?: PoolBrief | undefined;
+}
+
+export interface PoolBrief {
+  audience: Audience;
+  tone: Tone;
+  types: readonly QuestionType[];
+  /** Concepts the pool already covers; a far shorter way to say so than listing its questions. */
+  covered: readonly string[];
+}
+
+const AUDIENCE_GUIDANCE: Record<Audience, string> = {
+  children: 'children aged 7 to 12: everyday words, short sentences, familiar examples',
+  teens: 'teenagers aged 13 to 17: plain language and examples from school and daily life',
+  adults: 'adults: the vocabulary of someone who works with the subject',
+};
+
+const TONE_GUIDANCE: Record<Tone, string> = {
+  neutral: 'neutral and direct',
+  friendly: 'warm and encouraging',
+  professional: 'professional, as in a workplace or an interview',
+  academic: 'precise and formal, as in a university exam',
+};
+
+const TYPE_GUIDANCE: Record<QuestionType, string> = {
+  conceptual: 'why something is the way it is, or how ideas relate',
+  scenario: 'a short realistic situation, asking for the best decision in it',
+  applied: 'putting the knowledge to use on a concrete task',
+  troubleshooting: 'working out what went wrong from the symptoms given',
+  calculation: 'working out a result, with every needed number in the question',
+};
+
+/** Only pool requests carry this, so ordinary assessments keep their prompt and PROMPT_VERSION its meaning. */
+function poolLines({ audience, tone, types, covered }: PoolBrief): string[] {
+  const lines = [
+    `Audience: ${AUDIENCE_GUIDANCE[audience]}. Tone: ${TONE_GUIDANCE[tone]}.`,
+    'Each question belongs to a pool that is taken many times, so it must make sense with no other question beside it.',
+    `Spread the questions evenly across these types and set "t" to the type of each: ${types
+      .map((type) => `${type} (${TYPE_GUIDANCE[type]})`)
+      .join(', ')}.`,
+    'Set "c" to the single concept the question tests, in at most five words. Every question tests a different concept.',
+    'Make "e" teach: say why the correct option is right and why the most tempting wrong option is not.',
+  ];
+  if (covered.length > 0) {
+    const list = covered.slice(0, MAX_COVERED).map((concept) => `- ${escapeTags(concept)}`);
+    lines.push(
+      `<covered>\n${list.join('\n')}\n</covered>`,
+      'The pool already tests the concepts in <covered>. Do not test them again, however differently worded. Write fewer questions rather than repeat one.',
+    );
+  }
+  return lines;
 }
 
 const escapeTags = (value: string) => value.replaceAll('<', '‹').replaceAll('>', '›');
 
 /** Bounds the input tokens spent on the de-duplication list. */
 const MAX_EXISTING = 60;
+/** Concepts are short; a pool's list stays cheap even when long. */
+const MAX_COVERED = 400;
 
 export function buildUserPrompt({
   topic,
@@ -54,6 +108,7 @@ export function buildUserPrompt({
   locale,
   counts,
   existing = [],
+  pool,
 }: PromptInput): string {
   const levels = LEVELS.filter((level) => counts[level] > 0);
   const total = levels.reduce((sum, level) => sum + counts[level], 0);
@@ -64,6 +119,7 @@ export function buildUserPrompt({
     `Language (BCP 47): ${locale}`,
     `Write exactly ${levels.map((level) => `${counts[level]} at difficulty ${level}`).join(', ')}: ${total} in total.`,
   );
+  if (pool) lines.push(...poolLines(pool));
   if (existing.length > 0) {
     const list = existing.slice(0, MAX_EXISTING).map((q) => `- ${escapeTags(q)}`);
     lines.push(`<existing>\n${list.join('\n')}\n</existing>`);

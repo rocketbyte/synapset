@@ -55,6 +55,19 @@ const ConfigSchema = z.object({
     .int()
     .min(3600)
     .default(365 * 86_400),
+  /**
+   * How long pool questions live. Long on purpose: a question written once is served for years instead of
+   * being paid for again. Server-only; no request can change it.
+   */
+  QUESTION_POOL_TTL_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(86_400)
+    .default(2 * 365 * 86_400),
+  /** Default ceiling per topic, audience, tone and difficulty. `pnpm admin pool-cap` overrides it live. */
+  QUESTION_POOL_CAP: z.coerce.number().int().min(1).max(1000).default(300),
+  /** New questions written per level in one pool generation. */
+  QUESTION_POOL_BATCH_PER_LEVEL: z.coerce.number().int().min(1).max(20).default(20),
   JOB_LEASE_SECONDS: z.coerce.number().int().min(30).default(300),
   JOB_STALE_SECONDS: z.coerce.number().int().min(60).default(900),
   MAX_DELIVERY_ATTEMPTS: z.coerce.number().int().min(1).default(5),

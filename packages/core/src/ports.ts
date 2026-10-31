@@ -7,9 +7,11 @@ import type {
   GenerateMessage,
   Job,
   Question,
+  QuestionPool,
   QuestionReport,
   TokenUsage,
 } from './schemas.js';
+import type { PoolCapRule } from './pools.js';
 
 export interface LlmCall {
   provider: LlmProviderName;
@@ -78,7 +80,8 @@ export interface AssessmentRepository {
   ): Promise<NearestMatch[]>;
   getAlias(key: string): Promise<string | null>;
   saveAlias(key: string, assessmentId: string, expiresAt: Date): Promise<void>;
-  saveAssessment(assessment: Assessment, embedding: number[]): Promise<void>;
+  /** `embedding` is null for slices, which are found by id and never by similarity. */
+  saveAssessment(assessment: Assessment, embedding: number[] | null): Promise<void>;
 
   /** Nearest bank questions of one difficulty within the scope and `maxDistance`, closest first. */
   findNearestQuestions(
@@ -92,6 +95,22 @@ export interface AssessmentRepository {
   getQuestions(ids: readonly string[]): Promise<BankQuestion[]>;
   /** Upserts content and embedding; never resets a question's status or report count. */
   saveQuestions(questions: readonly BankQuestion[]): Promise<void>;
+
+  getPool(id: string): Promise<QuestionPool | null>;
+  /** Returns the stored pool, which is an earlier one if another request created it first. */
+  createPool(pool: QuestionPool): Promise<QuestionPool>;
+  /**
+   * Adds questions at the end of their levels, skipping ids and concepts already there, and extends the
+   * pool's expiry to cover them. Atomic, so concurrent fills cannot overwrite each other.
+   */
+  appendToPool(
+    id: string,
+    questions: readonly Pick<BankQuestion, 'id' | 'd' | 'c' | 'q' | 'expiresAt'>[],
+    saturatedUntil: QuestionPool['saturatedUntil'],
+    now: Date,
+  ): Promise<QuestionPool>;
+  getPoolCapRules(): Promise<PoolCapRule[]>;
+  savePoolCapRules(rules: readonly PoolCapRule[]): Promise<void>;
 
   /** Stores the report unless this account already reported this question; returns whether it was new. */
   recordReport(report: QuestionReport): Promise<boolean>;
@@ -203,7 +222,7 @@ export type UsageEvent =
       route: string;
       status: number;
       latency_ms: number;
-      match: 'exact' | 'semantic' | 'composed' | null;
+      match: 'exact' | 'semantic' | 'composed' | 'pool' | null;
       generation_queued: boolean;
     })
   | (UsageEventBase & {

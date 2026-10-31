@@ -3,13 +3,17 @@ import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import {
+  AUDIENCES,
   BACKGROUND_QUESTIONS,
   FeedbackService,
   FirestoreAssessmentRepository,
   FirestoreIdentityRepository,
+  LEVELS,
+  MAX_POOL_CAP,
   PLAN_NAMES,
   REPORT_REASONS,
   SCOPES,
+  TONES,
   VertexEmbedder,
   cleanContext,
   cosine,
@@ -21,8 +25,12 @@ import {
   noiseFloor,
   normalizeTopic,
   requestText,
+  type Audience,
+  type Level,
   type PlanName,
+  type PoolCapRule,
   type Scope,
+  type Tone,
 } from '@synapset/core';
 
 const USAGE = `Usage: pnpm admin <command> [options]
@@ -41,6 +49,13 @@ const USAGE = `Usage: pnpm admin <command> [options]
   question restore    --question <id>      reactivate after review and dismiss its reports
   calibrate           [--file <path>]      measure reuse margins on a labelled set (default calibration.json)
 
+  pool-cap list                            live caps (QUESTION_POOL_CAP applies where no rule matches)
+  pool-cap set    --cap <n> [dimensions]   raise or lower a cap, live within 30 seconds, no deploy
+  pool-cap remove [dimensions]             drop the rule with exactly these dimensions
+
+Dimensions, all optional; the most specific matching rule wins:
+  --topic <text> --audience ${AUDIENCES.join('|')} --tone ${TONES.join('|')} --locale <tag> --level ${LEVELS.join('|')}
+
 Scopes: ${SCOPES.join(', ')} (default: all)`;
 
 const { positionals, values } = parseArgs({
@@ -55,6 +70,12 @@ const { positionals, values } = parseArgs({
     question: { type: 'string' },
     limit: { type: 'string' },
     file: { type: 'string' },
+    cap: { type: 'string' },
+    topic: { type: 'string' },
+    audience: { type: 'string' },
+    tone: { type: 'string' },
+    locale: { type: 'string' },
+    level: { type: 'string' },
   },
 });
 
@@ -89,6 +110,28 @@ function limit(fallback: number): number {
     fail('--limit must be an integer from 1 to 5000');
   return value;
 }
+
+function capDimensions(): Omit<PoolCapRule, 'cap'> {
+  const { topic, audience, tone, locale, level } = values;
+  if (audience && !(AUDIENCES as readonly string[]).includes(audience))
+    fail(`Unknown audience "${audience}"`);
+  if (tone && !(TONES as readonly string[]).includes(tone)) fail(`Unknown tone "${tone}"`);
+  if (level && !LEVELS.map(String).includes(level)) fail(`Unknown level "${level}"`);
+  return {
+    ...(topic ? { topic: normalizeTopic(topic) } : {}),
+    ...(audience ? { audience: audience as Audience } : {}),
+    ...(tone ? { tone: tone as Tone } : {}),
+    ...(locale ? { locale } : {}),
+    ...(level ? { level: Number(level) as Level } : {}),
+  };
+}
+
+const sameDimensions = (a: Omit<PoolCapRule, 'cap'>, b: PoolCapRule) => {
+  const { cap: _cap, ...others } = b;
+  const keys = (rule: Record<string, unknown>) =>
+    JSON.stringify(Object.entries(rule).sort(([x], [y]) => x.localeCompare(y)));
+  return keys(a) === keys(others);
+};
 
 const config = loadConfig();
 const firestore = createFirestore(config);
@@ -193,6 +236,30 @@ async function run(command: string) {
       const outcome = await feedback.restore(required('question'), config.ASSESSMENT_TTL_SECONDS);
       if (outcome.status === 'not_found') fail('Question not found');
       console.error(`Restored. ${String(outcome.dismissed)} reports dismissed.`);
+      return;
+    }
+    case 'pool-cap list':
+      console.error(`Default: ${String(config.QUESTION_POOL_CAP)}`);
+      console.table(await assessments.getPoolCapRules());
+      return;
+    case 'pool-cap set': {
+      const cap = Number(required('cap'));
+      if (!(Number.isInteger(cap) && cap >= 1 && cap <= MAX_POOL_CAP))
+        fail(`--cap must be an integer from 1 to ${String(MAX_POOL_CAP)}`);
+      const dimensions = capDimensions();
+      const others = (await assessments.getPoolCapRules()).filter((r) => !sameDimensions(dimensions, r));
+      await assessments.savePoolCapRules([...others, { ...dimensions, cap }]);
+      console.error(
+        'Saved. Live everywhere within 30 seconds. Lowering a cap hides questions, not deletes them.',
+      );
+      return;
+    }
+    case 'pool-cap remove': {
+      const dimensions = capDimensions();
+      const rules = await assessments.getPoolCapRules();
+      const others = rules.filter((r) => !sameDimensions(dimensions, r));
+      if (others.length === rules.length) fail('No rule has exactly these dimensions');
+      await assessments.savePoolCapRules(others);
       return;
     }
     case 'calibrate':

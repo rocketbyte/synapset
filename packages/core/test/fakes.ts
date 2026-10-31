@@ -5,6 +5,7 @@ import {
   SCOPES,
   createLogger,
   limitsFor,
+  withQuestions,
   type Account,
   type ApiKeyRecord,
   type Assessment,
@@ -27,6 +28,8 @@ import {
   type VerifyInput,
   type NearestMatch,
   type NewJob,
+  type PoolCapRule,
+  type QuestionPool,
   type Question,
 } from '@synapset/core';
 
@@ -251,9 +254,36 @@ export class InMemoryRepository implements AssessmentRepository {
     this.aliases.set(key, assessmentId);
     return Promise.resolve();
   }
-  saveAssessment(value: Assessment, embedding: number[]) {
+  saveAssessment(value: Assessment, embedding: number[] | null) {
     this.assessments.set(value.id, value);
-    this.embeddings.set(value.id, embedding);
+    if (embedding) this.embeddings.set(value.id, embedding);
+    return Promise.resolve();
+  }
+  pools = new Map<string, QuestionPool>();
+  capRules: PoolCapRule[] = [];
+  getPool(id: string) {
+    return Promise.resolve(this.pools.get(id) ?? null);
+  }
+  createPool(pool: QuestionPool) {
+    const stored = this.pools.get(pool.id) ?? pool;
+    this.pools.set(pool.id, stored);
+    return Promise.resolve(stored);
+  }
+  appendToPool(
+    id: string,
+    added: Parameters<AssessmentRepository['appendToPool']>[1],
+    saturatedUntil: QuestionPool['saturatedUntil'],
+    now: Date,
+  ) {
+    const updated = withQuestions(this.pools.get(id) as QuestionPool, added, saturatedUntil, now);
+    this.pools.set(id, updated);
+    return Promise.resolve(updated);
+  }
+  getPoolCapRules() {
+    return Promise.resolve(this.capRules);
+  }
+  savePoolCapRules(rules: readonly PoolCapRule[]) {
+    this.capRules = [...rules];
     return Promise.resolve();
   }
   getJob(id: string) {

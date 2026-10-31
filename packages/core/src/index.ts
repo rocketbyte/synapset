@@ -17,6 +17,7 @@ export * from './config.js';
 export * from './domain.js';
 export * from './errors.js';
 export * from './logger.js';
+export * from './pools.js';
 export * from './ports.js';
 export * from './prompt.js';
 export * from './schemas.js';
@@ -31,6 +32,7 @@ export { AnthropicLlmProvider, GeminiLlmProvider, FailoverLlmProvider };
 export * from './services/assessments.js';
 export * from './services/generation.js';
 export * from './services/identity.js';
+export * from './services/pools.js';
 export * from './services/spend.js';
 
 function buildProvider(name: LlmProviderName, config: Config): LlmProvider {

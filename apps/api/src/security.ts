@@ -31,7 +31,7 @@ declare module 'fastify' {
     principal: Principal | null;
     /** Concurrency slot held by this request; released when the response is sent. */
     slot: string | null;
-    match: 'exact' | 'semantic' | 'composed' | null;
+    match: 'exact' | 'semantic' | 'composed' | 'pool' | null;
     generationQueued: boolean;
   }
 }

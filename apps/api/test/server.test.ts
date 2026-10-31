@@ -5,6 +5,8 @@ import {
   FeedbackService,
   LogUsageRecorder,
   MemoryLimitStore,
+  PoolCaps,
+  PoolService,
   SpendGuard,
   counterKeys,
   createLogger,
@@ -72,8 +74,17 @@ async function setup(
       jobStaleSeconds: 900,
     },
   );
+  const pools = new PoolService(
+    repo,
+    new FakeEmbedder(),
+    new FakeQueue(),
+    new SpendGuard(limits, options.budgetUsd ?? 10),
+    new PoolCaps(repo, 300, createLogger('test', 'silent')),
+    { ttlSeconds: 63_072_000, batchPerLevel: 2, sliceTtlSeconds: 3600, jobStaleSeconds: 900 },
+  );
   const app = await buildServer({
     service,
+    pools,
     feedback: new FeedbackService(
       repo,
       { quarantineAfterReports: options.quarantineAfterReports ?? 2 },
@@ -431,5 +442,28 @@ describe('assessments', () => {
     // The API itself keeps the strict policy.
     const api = await app.inject({ method: 'GET', url: '/v1/usage' });
     expect(api.headers['content-security-policy']).toBe("default-src 'none'; frame-ancestors 'none'");
+  });
+
+  it('refuses a client-chosen lifetime for pool questions', async () => {
+    const { app, auth } = await setup();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/pools/next',
+      headers: auth,
+      payload: { topic: 'PostgreSQL', questionsPerLevel: 4, ttlSeconds: 3600 },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('queues a generation for an empty pool and points at the job', async () => {
+    const { app, auth } = await setup();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/pools/next',
+      headers: auth,
+      payload: { topic: 'PostgreSQL', questionsPerLevel: 2, audience: 'adults', poolSize: 100 },
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.headers.location).toBe(`/v1/jobs/${res.json<{ jobId: string }>().jobId}`);
   });
 });

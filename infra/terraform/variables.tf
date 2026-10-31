@@ -65,6 +65,23 @@ variable "questions_per_level" {
   default = 10
 }
 
+variable "question_pool_ttl_seconds" {
+  description = "Lifetime of pool questions. Two years: long enough that a question is rarely paid for twice."
+  type        = number
+  default     = 63072000
+}
+
+variable "question_pool_cap" {
+  description = "Default questions per topic, audience, tone and difficulty. pnpm admin pool-cap overrides it live."
+  type        = number
+  default     = 300
+}
+
+variable "question_pool_batch_per_level" {
+  type    = number
+  default = 20
+}
+
 variable "api_max_instances" {
   type    = number
   default = 10

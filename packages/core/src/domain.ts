@@ -53,6 +53,13 @@ export function requestIdentity({ topicNormalized, context, style, reuse }: Requ
   return parts.join('\n');
 }
 
+/** Concepts compared by their words, per difficulty: the same idea may be asked once at each level. */
+export const conceptKey = (level: number, concept: string) =>
+  `${level}:${concept
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()}`;
+
 /** Text embedded for a bank question: retrieval matched topics best on the question plus its answer. */
 export const questionText = (question: Pick<Question, 'q' | 'o' | 'a'>) =>
   `${question.q} ${question.o[question.a] ?? ''}`.trim();
@@ -132,11 +139,11 @@ export function shuffleOptions(question: Question): Question {
     [order[i], order[j]] = [order[j] as number, order[i] as number];
   }
   return {
+    ...question,
     q: question.q.trim(),
     o: order.map((i) => (question.o[i] as string).trim()),
     a: order.indexOf(question.a),
     e: question.e.trim(),
-    d: question.d,
   };
 }
 
