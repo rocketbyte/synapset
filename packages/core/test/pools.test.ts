@@ -202,6 +202,12 @@ describe('pools end to end', () => {
     llmInstance = llm();
   });
 
+  it('writes enough in one go for a slice larger than the batch', async () => {
+    const first = await ready({ ...input, questionsPerLevel: 7 }, pools(openGate, 6));
+    expect(llmInstance.calls).toBe(1);
+    expect(first.assessment.questions).toHaveLength(21);
+  });
+
   it('writes on demand, serves later takes without the model, and tells it what is covered', async () => {
     const first = await ready(input);
     expect(llmInstance.calls).toBe(1);
