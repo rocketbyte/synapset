@@ -1,5 +1,12 @@
 import type { LevelCounts } from './domain.js';
-import { LEVELS, type Audience, type Question, type QuestionType, type Tone } from './schemas.js';
+import {
+  LEVELS,
+  type Audience,
+  type PoolLanguage,
+  type Question,
+  type QuestionType,
+  type Tone,
+} from './schemas.js';
 
 /**
  * Bump whenever the prompts, or how their output is checked, change: it is part of the cache scope, so
@@ -45,12 +52,25 @@ export interface PromptInput {
 }
 
 export interface PoolBrief {
+  language: PoolLanguage;
   audience: Audience;
   tone: Tone;
   types: readonly QuestionType[];
   /** Concepts the pool already covers; a far shorter way to say so than listing its questions. */
   covered: readonly string[];
 }
+
+const LANGUAGE_NAMES: Record<PoolLanguage, string> = {
+  en: 'English',
+  es: 'Spanish',
+  zh: 'Simplified Chinese',
+  hi: 'Hindi',
+  ar: 'Modern Standard Arabic',
+  pt: 'Portuguese',
+  fr: 'French',
+  de: 'German',
+  ja: 'Japanese',
+};
 
 const AUDIENCE_GUIDANCE: Record<Audience, string> = {
   children: 'children aged 7 to 12: everyday words, short sentences, familiar examples',
@@ -74,8 +94,9 @@ const TYPE_GUIDANCE: Record<QuestionType, string> = {
 };
 
 /** Only pool requests carry this, so ordinary assessments keep their prompt and PROMPT_VERSION its meaning. */
-function poolLines({ audience, tone, types, covered }: PoolBrief): string[] {
+function poolLines({ language, audience, tone, types, covered }: PoolBrief): string[] {
   const lines = [
+    `Write every question, option and explanation in ${LANGUAGE_NAMES[language]}, as a native speaker would, keeping technical terms that people in the field leave untranslated.`,
     `Audience: ${AUDIENCE_GUIDANCE[audience]}. Tone: ${TONE_GUIDANCE[tone]}.`,
     'Each question belongs to a pool that is taken many times, so it must make sense with no other question beside it.',
     `Spread the questions evenly across these types and set "t" to the type of each: ${types

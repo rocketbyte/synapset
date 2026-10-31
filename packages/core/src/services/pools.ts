@@ -22,6 +22,7 @@ import {
   type Audience,
   type BankQuestion,
   type Job,
+  type PoolLanguage,
   type QuestionPool,
   type QuestionType,
   type Tone,
@@ -72,7 +73,7 @@ export interface PoolServiceOptions {
 export interface NextSliceInput {
   topic: string;
   context?: string | undefined;
-  locale: string;
+  locale: PoolLanguage;
   audience: Audience;
   tone: Tone;
   types: readonly QuestionType[];

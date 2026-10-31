@@ -15,7 +15,13 @@ import {
 } from '../domain.js';
 import { InvalidOutputError, PermanentError, TransientError } from '../errors.js';
 import { PROMPT_VERSION, type PoolBrief } from '../prompt.js';
-import { LEVELS, type BankQuestion, type GenerateMessage, type Question } from '../schemas.js';
+import {
+  LEVELS,
+  type BankQuestion,
+  type GenerateMessage,
+  type PoolLanguage,
+  type Question,
+} from '../schemas.js';
 import type {
   AssessmentRepository,
   Clock,
@@ -216,6 +222,7 @@ export class GenerationService {
     if (!pool) throw new PermanentError(`Pool ${target.id} no longer exists`);
     const held = await this.bank.get(LEVELS.flatMap((level) => pool.levels[level]).map(({ id }) => id));
     const brief: PoolBrief = {
+      language: pool.locale as PoolLanguage,
       audience: pool.audience,
       tone: pool.tone,
       types: pool.types,
@@ -245,6 +252,7 @@ export class GenerationService {
       pool.scope,
       pool.id,
       expiresAt,
+      { locale: pool.locale, audience: pool.audience, tone: pool.tone },
     );
     const saturatedUntil = Object.fromEntries(
       LEVELS.filter((level) => {

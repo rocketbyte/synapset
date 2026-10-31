@@ -56,6 +56,7 @@ function toBankQuestion(snapshot: DocumentSnapshot): BankQuestion {
     d: d.d as number,
     ...(d.t ? { t: d.t as NonNullable<BankQuestion['t']> } : {}),
     ...(d.c ? { c: d.c as string } : {}),
+    ...(d.labels ? { labels: d.labels as NonNullable<BankQuestion['labels']> } : {}),
     scope: d.scope as string,
     // Quarantine records created from a report carry no embedding.
     embedding: (d.embedding as VectorValue | undefined)?.toArray() ?? [],

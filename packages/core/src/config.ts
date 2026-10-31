@@ -66,8 +66,11 @@ const ConfigSchema = z.object({
     .default(2 * 365 * 86_400),
   /** Default ceiling per topic, audience, tone and difficulty. `pnpm admin pool-cap` overrides it live. */
   QUESTION_POOL_CAP: z.coerce.number().int().min(1).max(1000).default(300),
-  /** New questions written per level in one pool generation. */
-  QUESTION_POOL_BATCH_PER_LEVEL: z.coerce.number().int().min(1).max(20).default(20),
+  /**
+   * New questions written per level each time a pool runs out. Small on purpose: a pool grows as it is
+   * used, so topics nobody retakes never pay for questions nobody sees.
+   */
+  QUESTION_POOL_BATCH_PER_LEVEL: z.coerce.number().int().min(1).max(20).default(6),
   JOB_LEASE_SECONDS: z.coerce.number().int().min(30).default(300),
   JOB_STALE_SECONDS: z.coerce.number().int().min(60).default(900),
   MAX_DELIVERY_ATTEMPTS: z.coerce.number().int().min(1).default(5),

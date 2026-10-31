@@ -19,6 +19,7 @@ import {
   MAX_CONTEXT_LENGTH,
   MAX_STYLE_LENGTH,
   MAX_TOPIC_LENGTH,
+  POOL_LANGUAGES,
   QUESTION_TYPES,
   QuotaExceededError,
   REPORT_REASONS,
@@ -38,6 +39,7 @@ import {
   type Job,
   type LimitStore,
   type Logger,
+  type PoolLanguage,
   type PoolService,
   type UsageRecorder,
 } from '@synapset/core';
@@ -145,7 +147,10 @@ const NextBody = z.strictObject({
       'What the topic means here and what to cover. Part of what identifies the pool, so keep it stable and never put anything about a person in it.',
     )
     .meta({ example: 'The relational database, as used by software engineers.' }),
-  locale: LocaleSchema.default('en').describe('Language of the questions'),
+  locale: z
+    .enum(POOL_LANGUAGES)
+    .default('en')
+    .describe('Language of the questions. Each language has its own pools, and so its own cap.'),
   audience: z.enum(AUDIENCES).default('adults').describe('Who the questions are written for'),
   tone: z.enum(TONES).default('neutral').describe('How the questions sound'),
   questionTypes: z
@@ -249,6 +254,7 @@ const AssessmentView = z.object({
     .describe('Answers and explanations are released only by grading'),
   slice: z
     .object({
+      language: z.enum(POOL_LANGUAGES),
       audience: z.enum(AUDIENCES),
       tone: z.enum(TONES),
       mode: z
@@ -343,7 +349,7 @@ const API_DESCRIPTION = `Turns a topic into a multiple-choice knowledge assessme
 
 **Question count.** Pass \`questionsPerLevel\` to get fewer questions than the server generates (three difficulty levels, so \`5\` returns 15). Each topic is generated once at the maximum, so any count is served from the same cached assessment. Use the same count when fetching and grading.
 
-**Question pools.** \`POST /v1/pools/next\` serves slices of a pool of questions kept per topic, audience, tone and difficulty. You hold the cursor; the service keeps nothing about your users. Questions are generated only when a slice needs ones that do not exist, and never again after that. Slices are assessments: fetch, grade and report them the same way.
+**Question pools.** \`POST /v1/pools/next\` serves slices of a pool of questions kept per topic, language, audience, tone and difficulty. You hold the cursor; the service keeps nothing about your users. Questions are generated only when a slice needs ones that do not exist, and never again after that. Slices are assessments: fetch, grade and report them the same way.
 
 **Answer checking.** Before an assessment is stored, a second model pass answers every question without the key. Questions it answers differently, or finds ambiguous, are discarded.
 
@@ -372,6 +378,7 @@ const presentAssessment = (service: AssessmentService, a: Assessment, perLevel: 
   ...(a.slice
     ? {
         slice: {
+          language: a.locale as PoolLanguage,
           audience: a.slice.audience,
           tone: a.slice.tone,
           mode: a.slice.mode,

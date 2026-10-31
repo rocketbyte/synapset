@@ -87,13 +87,14 @@ describe('caps', () => {
     expect(capFor(rules, 300, { ...pool, level: 1 })).toBe(500);
     expect(capFor(rules, 300, { ...pool, level: 3 })).toBe(80);
     expect(capFor(rules, 300, { ...pool, audience: 'children', level: 1 })).toBe(50);
+    expect(capFor([{ locale: 'es', cap: 40 }], 300, { ...pool, level: 1 })).toBe(300);
   });
 
   it('splits a total over the levels', () => {
     expect([1, 2, 3].map((level) => shareOf(100, [1, 2, 3], level as 1 | 2 | 3))).toEqual([34, 33, 33]);
   });
 
-  it('gives each audience and tone its own pool', () => {
+  it('gives each language, audience and tone its own pool', () => {
     const base = {
       topicNormalized: 'sql',
       context: null,
@@ -105,6 +106,7 @@ describe('caps', () => {
     };
     expect(poolKey(base)).not.toBe(poolKey({ ...base, audience: 'children' }));
     expect(poolKey(base)).not.toBe(poolKey({ ...base, tone: 'friendly' }));
+    expect(poolKey(base)).not.toBe(poolKey({ ...base, locale: 'es' }));
     expect(poolKey(base)).toBe(poolKey({ ...base, types: ['conceptual', 'scenario'] }));
   });
 });
@@ -206,6 +208,9 @@ describe('pools end to end', () => {
     expect(first.assessment.questions).toHaveLength(12);
     const stored = [...repo.bank.values()][0];
     expect(stored?.expiresAt.getTime()).toBe(NOW.getTime() + TWO_YEARS * 1000);
+    expect(stored?.labels).toEqual({ locale: 'en', audience: 'adults', tone: 'professional' });
+    // One chunk, not the pool's 60.
+    expect(repo.bank.size).toBe(24);
 
     const second = await ready({
       ...input,

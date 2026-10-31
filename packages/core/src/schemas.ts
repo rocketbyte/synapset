@@ -20,6 +20,10 @@ export type Audience = (typeof AUDIENCES)[number];
 export const TONES = ['neutral', 'friendly', 'professional', 'academic'] as const;
 export type Tone = (typeof TONES)[number];
 
+/** Languages a pool can be written in, by BCP 47 tag. Each has its own pools, and so its own cap. */
+export const POOL_LANGUAGES = ['en', 'es', 'zh', 'hi', 'ar', 'pt', 'fr', 'de', 'ja'] as const;
+export type PoolLanguage = (typeof POOL_LANGUAGES)[number];
+
 /** What a question asks the reader to do. */
 export const QUESTION_TYPES = [
   'conceptual',
@@ -163,7 +167,7 @@ export interface QuestionPool {
   audience: Audience;
   tone: Tone;
   types: QuestionType[];
-  /** Bank scope of its questions. */
+  /** Bank scope of its questions, which covers the same labels. */
   scope: string;
   levels: Record<1 | 2 | 3, PoolEntry[]>;
   /** Epoch milliseconds per level: the subject ran out of new concepts, so generation waits until then. */
@@ -172,9 +176,17 @@ export interface QuestionPool {
   expiresAt: Date;
 }
 
+export interface QuestionLabels {
+  locale: string;
+  audience: Audience;
+  tone: Tone;
+}
+
 /** A checked question stored on its own, so other assessments can reuse it without an LLM call. */
 export interface BankQuestion extends Question {
   id: string;
+  /** Set on pool questions: who and how it was written for, for consumers and operators reading the bank. */
+  labels?: QuestionLabels | undefined;
   /** Hash of what makes questions interchangeable: locale, style, prompt version, embedding model. */
   scope: string;
   /** Embedding of the question and its correct option. */
