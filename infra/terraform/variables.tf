@@ -72,14 +72,15 @@ variable "question_pool_ttl_seconds" {
 }
 
 variable "question_pool_cap" {
-  description = "Default questions per topic, audience, tone and difficulty. pnpm admin pool-cap overrides it live."
+  description = "Default questions per topic, language, audience, tone and difficulty. pnpm admin pool-cap overrides it live."
   type        = number
   default     = 300
 }
 
 variable "question_pool_batch_per_level" {
-  type    = number
-  default = 20
+  description = "New questions per level each time a pool runs out. Small, so pools grow only as they are used."
+  type        = number
+  default     = 6
 }
 
 variable "api_max_instances" {

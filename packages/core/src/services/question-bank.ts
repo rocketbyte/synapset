@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 import { EMBEDDING_DIMENSIONS } from '../config.js';
 import { bankQuestionId, conceptKey, cosine, questionText, type LevelCounts } from '../domain.js';
-import { LEVELS, type BankQuestion, type Question, type ReuseMode } from '../schemas.js';
+import { LEVELS, type BankQuestion, type Question, type QuestionLabels, type ReuseMode } from '../schemas.js';
 import type { AssessmentRepository, Clock, Embedder } from '../ports.js';
 
 /**
@@ -195,11 +195,13 @@ export class QuestionBank {
     scope: string,
     sourceAssessmentId: string,
     expiresAt: Date,
+    labels?: QuestionLabels,
   ): Promise<void> {
     const now = this.clock();
     await this.repo.saveQuestions(
       questions.map((question, i) => ({
         ...question,
+        ...(labels ? { labels } : {}),
         id: bankQuestionId(scope, question),
         scope,
         embedding: embeddings[i] as number[],
