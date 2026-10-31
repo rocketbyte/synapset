@@ -14,7 +14,6 @@ import {
   planSlice,
   poolKey,
   shareOf,
-  type GenerateMessage,
   type GenerationGate,
   type GenerationResult,
   type LevelCounts,
